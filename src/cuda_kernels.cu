@@ -374,8 +374,12 @@ __global__ void despillKernel(float* __restrict__ fgr,
     int idx = y * width + x;
     float alpha = pha[idx];
 
-    // Only process semi-transparent pixels (edges)
-    if (alpha >= 0.95f || alpha <= 0.05f) return;
+    // Gradual falloff: full despill at alpha=0.5 (edge), zero at alpha=0 or 1
+    // Parabola 4*a*(1-a) peaks at 1.0 when a=0.5, smooth falloff to 0 at extremes
+    float edgeWeight = 4.0f * alpha * (1.0f - alpha);
+    if (edgeWeight < 0.01f) return;
+
+    float effectiveStrength = strength * edgeWeight;
 
     int ps = width * height;
     float r = fgr[0 * ps + idx];
@@ -387,17 +391,17 @@ __global__ void despillKernel(float* __restrict__ fgr,
         // Green-dominant background: suppress green spill
         limit = fmaxf(r, b);
         if (g > limit)
-            g = limit + (g - limit) * (1.0f - strength);
+            g = limit + (g - limit) * (1.0f - effectiveStrength);
     } else if (bgB > bgR && bgB > bgG) {
         // Blue-dominant background: suppress blue spill
         limit = fmaxf(r, g);
         if (b > limit)
-            b = limit + (b - limit) * (1.0f - strength);
+            b = limit + (b - limit) * (1.0f - effectiveStrength);
     } else {
         // Red-dominant background: suppress red spill
         limit = fmaxf(g, b);
         if (r > limit)
-            r = limit + (r - limit) * (1.0f - strength);
+            r = limit + (r - limit) * (1.0f - effectiveStrength);
     }
 
     fgr[0 * ps + idx] = r;

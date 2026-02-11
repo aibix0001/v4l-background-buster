@@ -26,7 +26,7 @@ static void printUsage(const char* prog) {
         "  -s, --smooth FACTOR       Alpha temporal smoothing (0.0-1.0, default: 1.0=off)\n"
         "      --despill STRENGTH    Suppress bg color fringe (0.0-1.0, default: 0.8, 0=off)\n"
         "      --no-refine           Disable guided filter alpha refinement\n"
-        "      --reset-interval N    Zero recurrent states every N frames (default: 300, 0=off)\n"
+        "      --reset-interval N    Zero recurrent states every N frames (default: 100, 0=off)\n"
         "      --no-fp16             Disable FP16 (use FP32)\n"
         "      --benchmark           Print per-frame timing stats\n"
         "  -h, --help                Show this help\n",

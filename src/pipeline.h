@@ -26,8 +26,8 @@ struct PipelineConfig {
     float despillStrength = 0.8f; // 0.0 = off, 1.0 = full suppression
     bool refineAlpha = true;     // guided filter alpha refinement
     int gfRadius = 3;            // guided filter radius (at low-res)
-    float gfEps = 0.02f;         // guided filter regularization
-    int resetInterval = 300;     // zero recurrent states every N frames (0 = disable)
+    float gfEps = 0.005f;        // guided filter regularization
+    int resetInterval = 100;     // zero recurrent states every N frames (0 = disable)
     bool benchmark = false;
 };
 
