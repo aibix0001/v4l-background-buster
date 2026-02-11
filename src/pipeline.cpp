@@ -22,45 +22,48 @@ Pipeline::~Pipeline() {
     if (stream_) cudaStreamDestroy(stream_);
     if (evStart_) cudaEventDestroy(evStart_);
     if (evStop_) cudaEventDestroy(evStop_);
+    if (tjHandle_) tjDestroy(tjHandle_);
 }
 
 bool Pipeline::init() {
-    // Init V4L2 capture
     if (!capture_.init()) return false;
-    if (capture_.pixelFormat() != V4L2_PIX_FMT_YUYV) {
+
+    captureFmt_ = capture_.pixelFormat();
+    if (captureFmt_ != V4L2_PIX_FMT_YUYV && captureFmt_ != V4L2_PIX_FMT_MJPEG) {
         char fourcc[5] = {};
-        uint32_t pf = capture_.pixelFormat();
-        memcpy(fourcc, &pf, 4);
-        fprintf(stderr, "Unsupported capture format: %s (only YUYV supported)\n", fourcc);
+        memcpy(fourcc, &captureFmt_, 4);
+        fprintf(stderr, "Unsupported capture format: %s (need YUYV or MJPEG)\n", fourcc);
         return false;
     }
 
-    // Update dimensions from what the camera actually gave us
     cfg_.width = capture_.width();
     cfg_.height = capture_.height();
     fprintf(stderr, "Using resolution: %dx%d\n", cfg_.width, cfg_.height);
 
-    // Init V4L2 output with actual dimensions
+    if (captureFmt_ == V4L2_PIX_FMT_MJPEG) {
+        tjHandle_ = tjInitDecompress();
+        if (!tjHandle_) {
+            fprintf(stderr, "Failed to init turbojpeg decompressor\n");
+            return false;
+        }
+        fprintf(stderr, "MJPEG capture — using turbojpeg for decode\n");
+    }
+
     output_ = std::make_unique<V4L2Output>(cfg_.outputDevice, cfg_.width, cfg_.height, V4L2_PIX_FMT_YUYV);
     if (!output_->init()) return false;
 
-    // Init TensorRT
     if (!engine_.loadOrBuild(cfg_.onnxPath, cfg_.planPath, cfg_.fp16,
                              cfg_.width, cfg_.height))
         return false;
     engine_.printBindings();
 
-    // CUDA stream + events
     CUDA_CHECK(cudaStreamCreate(&stream_));
     if (cfg_.benchmark) {
         CUDA_CHECK(cudaEventCreate(&evStart_));
         CUDA_CHECK(cudaEventCreate(&evStop_));
     }
 
-    // Allocate GPU + pinned memory
     if (!allocateGpuMemory()) return false;
-
-    // Start capture
     if (!capture_.startStreaming()) return false;
 
     fprintf(stderr, "Pipeline initialized successfully\n");
@@ -72,14 +75,14 @@ bool Pipeline::allocateGpuMemory() {
     int H = cfg_.height;
     int pixels = W * H;
 
-    captureBytes_ = pixels * 2;       // YUYV: 2 bytes/pixel
-    outputBytes_ = pixels * 2;
-    size_t srcBytes = pixels * 3 * sizeof(__half);   // RGB FP16 BCHW
-    size_t fgrBytes = pixels * 3 * sizeof(__half);
-    size_t phaBytes = pixels * 1 * sizeof(__half);
+    rgbBytes_ = pixels * 3;
+    yuyvBytes_ = pixels * 2;
+    size_t srcBytes = pixels * 3 * sizeof(float);  // RGB FP32 BCHW
+    size_t fgrBytes = pixels * 3 * sizeof(float);
+    size_t phaBytes = pixels * 1 * sizeof(float);
 
-    // Compute recurrent state dimensions
-    int intH = H / 4;  // downsample_ratio=0.25
+    // Recurrent state dimensions (from simplified model's static shapes)
+    int intH = H / 4;
     int intW = W / 4;
     int divs[] = {2, 4, 8, 16};
     int chs[] = {16, 20, 40, 64};
@@ -87,21 +90,19 @@ bool Pipeline::allocateGpuMemory() {
         recDims_[i].ch = chs[i];
         recDims_[i].h = (intH + divs[i] - 1) / divs[i];
         recDims_[i].w = (intW + divs[i] - 1) / divs[i];
-        recDims_[i].bytes = 1 * chs[i] * recDims_[i].h * recDims_[i].w * sizeof(__half);
+        recDims_[i].bytes = 1 * chs[i] * recDims_[i].h * recDims_[i].w * sizeof(float);
     }
 
-    // Pinned host memory
-    CUDA_CHECK(cudaHostAlloc(&h_capture_, captureBytes_, cudaHostAllocDefault));
-    CUDA_CHECK(cudaHostAlloc(&h_output_, outputBytes_, cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&h_rgb_, rgbBytes_, cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&h_output_, yuyvBytes_, cudaHostAllocDefault));
 
-    // Device memory
-    CUDA_CHECK(cudaMalloc(&d_inputYuyv_, captureBytes_));
+    CUDA_CHECK(cudaMalloc(&d_inputRgb_, rgbBytes_));
+    CUDA_CHECK(cudaMalloc(&d_inputYuyv_, yuyvBytes_));
     CUDA_CHECK(cudaMalloc(&d_src_, srcBytes));
     CUDA_CHECK(cudaMalloc(&d_fgr_, fgrBytes));
     CUDA_CHECK(cudaMalloc(&d_pha_, phaBytes));
-    CUDA_CHECK(cudaMalloc(&d_outputYuyv_, outputBytes_));
+    CUDA_CHECK(cudaMalloc(&d_outputYuyv_, yuyvBytes_));
 
-    // Recurrent state ping-pong buffers
     for (int s = 0; s < 2; s++) {
         for (int i = 0; i < 4; i++) {
             CUDA_CHECK(cudaMalloc(&d_rec_[s][i], recDims_[i].bytes));
@@ -109,18 +110,14 @@ bool Pipeline::allocateGpuMemory() {
         }
     }
 
-    // Downsample ratio scalar on device
-    CUDA_CHECK(cudaMalloc(&d_dsRatio_, sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_dsRatio_, &cfg_.downsampleRatio, sizeof(float),
-                          cudaMemcpyHostToDevice));
-
-    fprintf(stderr, "GPU memory allocated\n");
+    fprintf(stderr, "GPU memory allocated (float32 I/O)\n");
     return true;
 }
 
 void Pipeline::freeGpuMemory() {
-    if (h_capture_) { cudaFreeHost(h_capture_); h_capture_ = nullptr; }
+    if (h_rgb_) { cudaFreeHost(h_rgb_); h_rgb_ = nullptr; }
     if (h_output_) { cudaFreeHost(h_output_); h_output_ = nullptr; }
+    if (d_inputRgb_) { cudaFree(d_inputRgb_); d_inputRgb_ = nullptr; }
     if (d_inputYuyv_) { cudaFree(d_inputYuyv_); d_inputYuyv_ = nullptr; }
     if (d_src_) { cudaFree(d_src_); d_src_ = nullptr; }
     if (d_fgr_) { cudaFree(d_fgr_); d_fgr_ = nullptr; }
@@ -129,57 +126,56 @@ void Pipeline::freeGpuMemory() {
     for (int s = 0; s < 2; s++)
         for (int i = 0; i < 4; i++)
             if (d_rec_[s][i]) { cudaFree(d_rec_[s][i]); d_rec_[s][i] = nullptr; }
-    if (d_dsRatio_) { cudaFree(d_dsRatio_); d_dsRatio_ = nullptr; }
 }
 
 bool Pipeline::processFrame() {
     if (cfg_.benchmark)
         cudaEventRecord(evStart_, stream_);
 
-    // 1. Capture frame from V4L2
+    // 1. Capture
     size_t frameSize = 0;
     const uint8_t* mmapPtr = capture_.dequeueFrame(frameSize);
     if (!mmapPtr) return false;
 
-    // Copy from mmap buffer to pinned host memory
-    memcpy(h_capture_, mmapPtr, frameSize);
-    capture_.requeueBuffer();
+    // 2. Decode and upload
+    if (captureFmt_ == V4L2_PIX_FMT_MJPEG) {
+        auto* jpegBuf = const_cast<uint8_t*>(mmapPtr);
+        int jpegSubsamp, jpegW, jpegH;
+        if (tjDecompressHeader2(tjHandle_, jpegBuf, frameSize,
+                                &jpegW, &jpegH, &jpegSubsamp) != 0) {
+            // Corrupt JPEG frame — skip it (common on first frames)
+            capture_.requeueBuffer();
+            return true;  // not fatal, just skip
+        }
+        if (tjDecompress2(tjHandle_, jpegBuf, frameSize,
+                          h_rgb_, cfg_.width, 0, cfg_.height,
+                          TJPF_RGB, TJFLAG_FASTDCT) != 0) {
+            capture_.requeueBuffer();
+            return true;  // skip corrupt frame
+        }
+        capture_.requeueBuffer();
 
-    // 2. Upload to GPU
-    CUDA_CHECK(cudaMemcpyAsync(d_inputYuyv_, h_capture_, captureBytes_,
-                               cudaMemcpyHostToDevice, stream_));
+        CUDA_CHECK(cudaMemcpyAsync(d_inputRgb_, h_rgb_, rgbBytes_,
+                                   cudaMemcpyHostToDevice, stream_));
+        launchRgbToFp32(d_inputRgb_, d_src_, cfg_.width, cfg_.height, stream_);
+    } else {
+        memcpy(h_rgb_, mmapPtr, frameSize);
+        capture_.requeueBuffer();
 
-    // 3. Preprocess: YUYV → RGB FP16 BCHW
-    launchYuyvToRgbFp16(d_inputYuyv_, d_src_, cfg_.width, cfg_.height, stream_);
+        CUDA_CHECK(cudaMemcpyAsync(d_inputYuyv_, h_rgb_, yuyvBytes_,
+                                   cudaMemcpyHostToDevice, stream_));
+        launchYuyvToRgbFp32(d_inputYuyv_, d_src_, cfg_.width, cfg_.height, stream_);
+    }
 
-    // 4. TensorRT inference with recurrent state ping-pong
+    // 3. TensorRT inference
     auto* ctx = engine_.context();
     int next = 1 - recIdx_;
 
-    // Set input shapes (required for dynamic dimensions)
-    nvinfer1::Dims4 srcShape{1, 3, cfg_.height, cfg_.width};
-    ctx->setInputShape("src", srcShape);
-
-    const char* riNames[] = {"r1i", "r2i", "r3i", "r4i"};
-    for (int i = 0; i < 4; i++) {
-        nvinfer1::Dims4 rShape{1, recDims_[i].ch,
-                               firstFrame_ ? 1 : recDims_[i].h,
-                               firstFrame_ ? 1 : recDims_[i].w};
-        ctx->setInputShape(riNames[i], rShape);
-    }
-
-    nvinfer1::Dims dsDim;
-    dsDim.nbDims = 1;
-    dsDim.d[0] = 1;
-    ctx->setInputShape("downsample_ratio", dsDim);
-
-    // Set tensor addresses
     ctx->setTensorAddress("src", d_src_);
-    ctx->setTensorAddress("r1i", firstFrame_ ? d_rec_[0][0] : d_rec_[recIdx_][0]);
-    ctx->setTensorAddress("r2i", firstFrame_ ? d_rec_[0][1] : d_rec_[recIdx_][1]);
-    ctx->setTensorAddress("r3i", firstFrame_ ? d_rec_[0][2] : d_rec_[recIdx_][2]);
-    ctx->setTensorAddress("r4i", firstFrame_ ? d_rec_[0][3] : d_rec_[recIdx_][3]);
-    ctx->setTensorAddress("downsample_ratio", d_dsRatio_);
+    ctx->setTensorAddress("r1i", d_rec_[recIdx_][0]);
+    ctx->setTensorAddress("r2i", d_rec_[recIdx_][1]);
+    ctx->setTensorAddress("r3i", d_rec_[recIdx_][2]);
+    ctx->setTensorAddress("r4i", d_rec_[recIdx_][3]);
     ctx->setTensorAddress("fgr", d_fgr_);
     ctx->setTensorAddress("pha", d_pha_);
     ctx->setTensorAddress("r1o", d_rec_[next][0]);
@@ -192,22 +188,18 @@ bool Pipeline::processFrame() {
         return false;
     }
     recIdx_ = next;
-    firstFrame_ = false;
 
-    // 5. Composite + color convert: FGR+PHA → YUYV
+    // 4. Composite + color convert
     launchCompositeToYuyv(d_fgr_, d_pha_, d_outputYuyv_,
                           cfg_.width, cfg_.height,
                           cfg_.bgR, cfg_.bgG, cfg_.bgB, stream_);
 
-    // 6. Download to host
-    CUDA_CHECK(cudaMemcpyAsync(h_output_, d_outputYuyv_, outputBytes_,
+    // 5. Download and write
+    CUDA_CHECK(cudaMemcpyAsync(h_output_, d_outputYuyv_, yuyvBytes_,
                                cudaMemcpyDeviceToHost, stream_));
-
-    // 7. Sync and write to v4l2loopback
     CUDA_CHECK(cudaStreamSynchronize(stream_));
-    output_->writeFrame(h_output_, outputBytes_);
+    output_->writeFrame(h_output_, yuyvBytes_);
 
-    // Benchmark timing
     if (cfg_.benchmark) {
         cudaEventRecord(evStop_, stream_);
         cudaEventSynchronize(evStop_);

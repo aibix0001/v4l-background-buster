@@ -2,8 +2,8 @@
 #include "v4l2_capture.h"
 #include "v4l2_output.h"
 #include "trt_engine.h"
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <turbojpeg.h>
 #include <memory>
 #include <string>
 
@@ -12,7 +12,7 @@ struct PipelineConfig {
     std::string outputDevice = "/dev/video10";
     int width = 1920;
     int height = 1080;
-    std::string onnxPath = "models/rvm_mobilenetv3_fp32.onnx";
+    std::string onnxPath = "models/rvm_mobilenetv3_fp32_simplified.onnx";
     std::string planPath = "models/rvm.plan";
     bool fp16 = true;
     float downsampleRatio = 0.25f;
@@ -31,7 +31,6 @@ public:
     bool init();
     bool processFrame();  // returns false on fatal error
 
-    // Stats from last frame (if benchmark enabled)
     float lastFrameMs() const { return lastFrameMs_; }
 
 private:
@@ -41,32 +40,31 @@ private:
     TrtEngine engine_;
 
     cudaStream_t stream_ = nullptr;
+    uint32_t captureFmt_ = 0;
+
+    tjhandle tjHandle_ = nullptr;
 
     // Pinned host memory
-    uint8_t* h_capture_ = nullptr;   // capture frame (host, pinned)
-    uint8_t* h_output_ = nullptr;    // output frame (host, pinned)
+    uint8_t* h_rgb_ = nullptr;
+    uint8_t* h_output_ = nullptr;
 
-    // Device memory
-    uint8_t* d_inputYuyv_ = nullptr;  // raw YUYV on GPU
-    __half*  d_src_ = nullptr;        // preprocessed RGB FP16 BCHW
-    __half*  d_fgr_ = nullptr;        // foreground output
-    __half*  d_pha_ = nullptr;        // alpha output
-    uint8_t* d_outputYuyv_ = nullptr; // composited YUYV on GPU
+    // Device memory (TRT I/O is float32 even with FP16 internal compute)
+    uint8_t* d_inputRgb_ = nullptr;
+    uint8_t* d_inputYuyv_ = nullptr;
+    float*   d_src_ = nullptr;        // preprocessed RGB FP32 BCHW
+    float*   d_fgr_ = nullptr;        // foreground output FP32
+    float*   d_pha_ = nullptr;        // alpha output FP32
+    uint8_t* d_outputYuyv_ = nullptr;
 
-    // Recurrent states: ping-pong buffers [2 sets][4 states]
-    __half* d_rec_[2][4] = {};
-    int recIdx_ = 0;                  // current read index
-    bool firstFrame_ = true;
+    // Recurrent states: ping-pong buffers [2 sets][4 states] (float32)
+    float* d_rec_[2][4] = {};
+    int recIdx_ = 0;
 
-    // Downsample ratio on device
-    float* d_dsRatio_ = nullptr;
-
-    // Recurrent state dimensions
     struct RecDim { int ch; int h; int w; size_t bytes; };
     RecDim recDims_[4] = {};
 
-    size_t captureBytes_ = 0;
-    size_t outputBytes_ = 0;
+    size_t rgbBytes_ = 0;
+    size_t yuyvBytes_ = 0;
 
     float lastFrameMs_ = 0.0f;
     cudaEvent_t evStart_ = nullptr, evStop_ = nullptr;

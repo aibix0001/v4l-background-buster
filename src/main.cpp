@@ -17,7 +17,7 @@ static void printUsage(const char* prog) {
         "  -o, --output DEVICE       v4l2loopback device (default: /dev/video10)\n"
         "  -W, --width N             Frame width (default: 1920)\n"
         "  -H, --height N            Frame height (default: 1080)\n"
-        "  -m, --model PATH          ONNX model path (default: models/rvm_mobilenetv3_fp32.onnx)\n"
+        "  -m, --model PATH          ONNX model path (default: models/rvm_mobilenetv3_fp32_simplified.onnx)\n"
         "  -e, --engine PATH         TensorRT plan cache (default: models/rvm.plan)\n"
         "  -d, --downsample RATIO    RVM downsample ratio (default: 0.25)\n"
         "  -b, --background MODE     green|color (default: green)\n"

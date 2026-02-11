@@ -1,6 +1,9 @@
 # Planning artefacts
 PLANS/
 
+# Python venv
+.venv/
+
 # Build
 build/
 *.o

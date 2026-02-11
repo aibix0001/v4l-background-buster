@@ -87,48 +87,7 @@ bool TrtEngine::buildFromOnnx(const std::string& onnxPath, const std::string& pl
         fprintf(stderr, "FP16 enabled\n");
     }
 
-    // Optimization profile for RVM's dynamic inputs
-    auto profile = builder->createOptimizationProfile();
-
-    // Compute recurrent state spatial dims at downsample_ratio=0.25
-    int intH = height / 4;  // 270 for 1080
-    int intW = width / 4;   // 480 for 1920
-
-    // src: fixed size [1,3,H,W]
-    nvinfer1::Dims4 srcDim{1, 3, height, width};
-    profile->setDimensions("src", nvinfer1::OptProfileSelector::kMIN, srcDim);
-    profile->setDimensions("src", nvinfer1::OptProfileSelector::kOPT, srcDim);
-    profile->setDimensions("src", nvinfer1::OptProfileSelector::kMAX, srcDim);
-
-    // Recurrent states: r1i-r4i
-    struct RecState { const char* name; int ch; int divH; int divW; };
-    RecState recStates[] = {
-        {"r1i", 16, 2, 2},
-        {"r2i", 20, 4, 4},
-        {"r3i", 40, 8, 8},
-        {"r4i", 64, 16, 16},
-    };
-    for (auto& rs : recStates) {
-        int rH = (intH + rs.divH - 1) / rs.divH;  // ceil division
-        int rW = (intW + rs.divW - 1) / rs.divW;
-        nvinfer1::Dims4 minDim{1, rs.ch, 1, 1};
-        nvinfer1::Dims4 optDim{1, rs.ch, rH, rW};
-        nvinfer1::Dims4 maxDim{1, rs.ch, rH, rW};
-        profile->setDimensions(rs.name, nvinfer1::OptProfileSelector::kMIN, minDim);
-        profile->setDimensions(rs.name, nvinfer1::OptProfileSelector::kOPT, optDim);
-        profile->setDimensions(rs.name, nvinfer1::OptProfileSelector::kMAX, maxDim);
-        fprintf(stderr, "  %s: opt [1,%d,%d,%d]\n", rs.name, rs.ch, rH, rW);
-    }
-
-    // downsample_ratio: scalar [1]
-    nvinfer1::Dims dsDim;
-    dsDim.nbDims = 1;
-    dsDim.d[0] = 1;
-    profile->setDimensions("downsample_ratio", nvinfer1::OptProfileSelector::kMIN, dsDim);
-    profile->setDimensions("downsample_ratio", nvinfer1::OptProfileSelector::kOPT, dsDim);
-    profile->setDimensions("downsample_ratio", nvinfer1::OptProfileSelector::kMAX, dsDim);
-
-    config->addOptimizationProfile(profile);
+    // The simplified ONNX model has all static shapes — no optimization profile needed.
 
     // Build serialized engine
     auto plan = std::unique_ptr<nvinfer1::IHostMemory, Deleter>(
