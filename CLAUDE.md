@@ -93,9 +93,9 @@ Two `FrameSlot` structs alternate: while the GPU processes frame N, the CPU capt
 - **Single CUDA stream**: All GPU work is serialized on one stream. Overlap is CPU-vs-GPU, not GPU-vs-GPU.
 - **Multi-resolution model support**: Model paths auto-resolved from capture resolution (e.g. `models/rvm_1080p.onnx`, `models/rvm_720p.plan`). install.sh builds models for multiple resolutions.
 - **Adaptive alpha temporal smoothing**: Optional EMA filter (`-s/--smooth`) with adaptive per-pixel strength — heavy smoothing at uncertain edges (alpha ~0.5), minimal at confident pixels (alpha ~0 or ~1), reduced on fast motion.
-- **Fast guided filter**: Alpha matte refinement using high-res RGB as guide (He & Sun 2015). Snaps soft matte edges to real image edges. Operates at 1/4 resolution for coefficient computation. On by default (`--no-refine` to disable).
-- **Despill**: CUDA kernel suppresses background color contamination in RVM's foreground output at semi-transparent edge pixels, eliminating color fringe (`--despill`, default 0.8).
-- **Recurrent state reset**: Periodic zeroing of RVM recurrent states prevents progressive color drift (`--reset-interval`, default 300 frames).
+- **Fast guided filter**: Alpha matte refinement using high-res RGB luminance as guide (He & Sun 2015). Snaps soft matte edges to real image edges. Operates at 1/4 resolution for coefficient computation (eps=0.005 for crisp edges). On by default (`--no-refine` to disable).
+- **Despill**: CUDA kernel suppresses background color contamination in RVM's foreground output at edges. Uses smooth parabolic falloff `4*a*(1-a)` instead of hard alpha cutoff — covers nearly-opaque hairline pixels that a hard threshold misses (`--despill`, default 0.8).
+- **Recurrent state reset**: Periodic zeroing of RVM recurrent states prevents progressive color drift (`--reset-interval`, default 100 frames). Drift becomes visible within ~90 frames, so 100 is the tuned sweet spot.
 - **V4L2 hardening**: poll() timeout before DQBUF, format verification after S_FMT, frame rate negotiation, dequeueLatestFrame() drains stale frames, DQBUF retry on EIO, consecutive skip counter.
 - **TensorRT plan files are GPU-specific and TRT-version-specific** — must be regenerated after driver or TensorRT updates.
 - **BT.601 limited-range**: YUYV→RGB uses limited-range coefficients; output sets V4L2 colorspace metadata.
