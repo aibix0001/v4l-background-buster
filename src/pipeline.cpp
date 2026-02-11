@@ -180,9 +180,9 @@ bool Pipeline::allocateGpuMemory() {
     size_t fgrBytes = pixels * 3 * sizeof(float);
     size_t phaBytes = pixels * 1 * sizeof(float);
 
-    // Recurrent state dimensions
-    int intH = H / 4;
-    int intW = W / 4;
+    // Recurrent state dimensions (scaled by downsample ratio)
+    int intH = static_cast<int>(H * cfg_.downsampleRatio);
+    int intW = static_cast<int>(W * cfg_.downsampleRatio);
     int divs[] = {2, 4, 8, 16};
     int chs[] = {16, 20, 40, 64};
     for (int i = 0; i < 4; i++) {

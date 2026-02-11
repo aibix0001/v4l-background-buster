@@ -20,7 +20,7 @@ static void printUsage(const char* prog) {
         "  -H, --height N            Frame height (default: 1080)\n"
         "  -m, --model PATH          ONNX model path (default: auto from resolution)\n"
         "  -e, --engine PATH         TensorRT plan cache (default: auto from resolution)\n"
-        "  -d, --downsample RATIO    RVM downsample ratio (default: 0.25)\n"
+        "  -d, --downsample RATIO    RVM downsample ratio (default: 0.5)\n"
         "  -b, --background MODE     green|color (default: green)\n"
         "  -c, --color R,G,B         Background color for 'color' mode\n"
         "  -s, --smooth FACTOR       Alpha temporal smoothing (0.0-1.0, default: 1.0=off)\n"

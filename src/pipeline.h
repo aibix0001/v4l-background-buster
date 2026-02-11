@@ -19,7 +19,7 @@ struct PipelineConfig {
     std::string onnxPath;   // empty = auto-resolve from resolution
     std::string planPath;   // empty = auto-resolve from resolution
     bool fp16 = true;
-    float downsampleRatio = 0.25f;
+    float downsampleRatio = 0.5f;
     uint8_t bgR = 0, bgG = 177, bgB = 64;  // green screen default
     float alphaSmoothing = 1.0f;  // 1.0 = no smoothing
     bool benchmark = false;

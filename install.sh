@@ -19,6 +19,11 @@ MODEL_DIR="models"
 MODEL_ORIG="$MODEL_DIR/rvm_mobilenetv3_fp32.onnx"
 MODEL_PATCHED="$MODEL_DIR/rvm_mobilenetv3_fp32_patched.onnx"
 
+# Downsample ratio (0.5 = internal matting at half resolution)
+DS_RATIO=0.5
+DS_NUM=1   # numerator  (0.5 = 1/2)
+DS_DEN=2   # denominator
+
 # Multi-resolution support: WxH pairs to build models for
 RESOLUTIONS=("1920x1080:1080p" "1280x720:720p")
 VENV_DIR=".venv"
@@ -164,75 +169,57 @@ if [ "$SKIP_MODEL" = false ]; then
     fi
 
     # 2. Set up Python venv (needed for patching/simplifying)
-    NEED_PYTHON=false
+    if ! check_cmd uv; then
+        info "Installing uv (Python package manager)"
+        curl -LsSf https://astral.sh/uv/0.6.2/install.sh | sh
+        export PATH="$HOME/.local/bin:$PATH"
+    fi
+
+    if [ ! -d "$VENV_DIR" ]; then
+        info "Creating Python virtual environment"
+        uv venv "$VENV_DIR"
+    fi
+
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/bin/activate"
+    uv pip install -q onnx==1.16.2 onnx-graphsurgeon==0.5.2 onnxsim onnxruntime
+    ok "Python environment ready"
+
+    # 3. Patch: bake downsample_ratio as constant (always regenerate — ratio may change)
+    info "Patching model (baking downsample_ratio=$DS_RATIO)"
+    python scripts/patch_onnx.py "$MODEL_ORIG" "$MODEL_PATCHED" $DS_RATIO
+    ok "Patched: $MODEL_PATCHED"
+
+    # 4. Simplify for each resolution (always regenerate — ratio may change)
     for res_entry in "${RESOLUTIONS[@]}"; do
+        dims="${res_entry%%:*}"
         tag="${res_entry#*:}"
-        if [ ! -f "$MODEL_DIR/rvm_${tag}.onnx" ]; then
-            NEED_PYTHON=true
-            break
-        fi
+        W="${dims%%x*}"
+        H="${dims#*x}"
+        ONNX_OUT="$MODEL_DIR/rvm_${tag}.onnx"
+
+        info "Simplifying model for ${tag} (${W}x${H}, ds_ratio=$DS_RATIO)"
+
+        # Compute recurrent state spatial dimensions
+        # intH = H * DS_RATIO, intW = W * DS_RATIO, then divide by {2,4,8,16} with ceiling
+        intH=$((H * DS_NUM / DS_DEN))
+        intW=$((W * DS_NUM / DS_DEN))
+        r1h=$(( (intH + 1) / 2 ))  ; r1w=$(( (intW + 1) / 2 ))
+        r2h=$(( (intH + 3) / 4 ))  ; r2w=$(( (intW + 3) / 4 ))
+        r3h=$(( (intH + 7) / 8 ))  ; r3w=$(( (intW + 7) / 8 ))
+        r4h=$(( (intH + 15) / 16 )); r4w=$(( (intW + 15) / 16 ))
+
+        onnxsim "$MODEL_PATCHED" "$ONNX_OUT" \
+            --overwrite-input-shape \
+            "src:1,3,${H},${W}" \
+            "r1i:1,16,${r1h},${r1w}" \
+            "r2i:1,20,${r2h},${r2w}" \
+            "r3i:1,40,${r3h},${r3w}" \
+            "r4i:1,64,${r4h},${r4w}"
+        ok "Simplified: $ONNX_OUT"
     done
 
-    if [ "$NEED_PYTHON" = true ]; then
-        if ! check_cmd uv; then
-            info "Installing uv (Python package manager)"
-            curl -LsSf https://astral.sh/uv/0.6.2/install.sh | sh
-            export PATH="$HOME/.local/bin:$PATH"
-        fi
-
-        if [ ! -d "$VENV_DIR" ]; then
-            info "Creating Python virtual environment"
-            uv venv "$VENV_DIR"
-        fi
-
-        # shellcheck disable=SC1091
-        source "$VENV_DIR/bin/activate"
-        uv pip install -q onnx==1.16.2 onnx-graphsurgeon==0.5.2 onnxsim onnxruntime
-        ok "Python environment ready"
-
-        # 3. Patch: bake downsample_ratio as constant (once)
-        if [ ! -f "$MODEL_PATCHED" ]; then
-            info "Patching model (baking downsample_ratio=0.25)"
-            python scripts/patch_onnx.py "$MODEL_ORIG" "$MODEL_PATCHED"
-            ok "Patched: $MODEL_PATCHED"
-        fi
-
-        # 4. Simplify for each resolution
-        for res_entry in "${RESOLUTIONS[@]}"; do
-            dims="${res_entry%%:*}"
-            tag="${res_entry#*:}"
-            W="${dims%%x*}"
-            H="${dims#*x}"
-            ONNX_OUT="$MODEL_DIR/rvm_${tag}.onnx"
-
-            if [ -f "$ONNX_OUT" ]; then
-                ok "Simplified model already exists: $ONNX_OUT"
-                continue
-            fi
-
-            info "Simplifying model for ${tag} (${W}x${H})"
-
-            # Compute recurrent state spatial dimensions
-            # intH = H/4, intW = W/4, then divide by {2,4,8,16} with ceiling
-            intH=$((H / 4))
-            intW=$((W / 4))
-            r1h=$(( (intH + 1) / 2 ))  ; r1w=$(( (intW + 1) / 2 ))
-            r2h=$(( (intH + 3) / 4 ))  ; r2w=$(( (intW + 3) / 4 ))
-            r3h=$(( (intH + 7) / 8 ))  ; r3w=$(( (intW + 7) / 8 ))
-            r4h=$(( (intH + 15) / 16 )); r4w=$(( (intW + 15) / 16 ))
-
-            onnxsim "$MODEL_PATCHED" "$ONNX_OUT" \
-                --overwrite-input-shape \
-                "src:1,3,${H},${W}" \
-                "r1i:1,16,${r1h},${r1w}" \
-                "r2i:1,20,${r2h},${r2w}" \
-                "r3i:1,40,${r3h},${r3w}" \
-                "r4i:1,64,${r4h},${r4w}"
-            ok "Simplified: $ONNX_OUT"
-        done
-
-        deactivate 2>/dev/null || true
-    fi
+    deactivate 2>/dev/null || true
 
     # Backward-compat symlink
     if [ ! -e "$MODEL_DIR/rvm_mobilenetv3_fp32_simplified.onnx" ] && [ -f "$MODEL_DIR/rvm_1080p.onnx" ]; then
