@@ -15,6 +15,12 @@ void launchRgbToFp32(const uint8_t* d_rgb_u8, float* d_rgb_fp32,
 void launchAlphaEma(float* d_pha, float* d_phaPrev,
                     int width, int height, float factor, cudaStream_t stream);
 
+// Despill: suppress background color contamination in FGR at semi-transparent edges
+void launchDespill(float* d_fgr, const float* d_pha,
+                   int width, int height,
+                   float bgR, float bgG, float bgB,
+                   float strength, cudaStream_t stream);
+
 // RVM outputs (fgr, pha) → composite with background → YUYV output
 // fgr: [1,3,H,W] float32, pha: [1,1,H,W] float32
 // output: YUYV packed uint8

@@ -24,6 +24,7 @@ static void printUsage(const char* prog) {
         "  -b, --background MODE     green|color (default: green)\n"
         "  -c, --color R,G,B         Background color for 'color' mode\n"
         "  -s, --smooth FACTOR       Alpha temporal smoothing (0.0-1.0, default: 1.0=off)\n"
+        "      --despill STRENGTH    Suppress bg color fringe (0.0-1.0, default: 0.8, 0=off)\n"
         "      --reset-interval N    Zero recurrent states every N frames (default: 300, 0=off)\n"
         "      --no-fp16             Disable FP16 (use FP32)\n"
         "      --benchmark           Print per-frame timing stats\n"
@@ -45,6 +46,7 @@ int main(int argc, char* argv[]) {
         {"background", required_argument, nullptr, 'b'},
         {"color",      required_argument, nullptr, 'c'},
         {"smooth",     required_argument, nullptr, 's'},
+        {"despill",    required_argument, nullptr, 4},
         {"reset-interval", required_argument, nullptr, 3},
         {"no-fp16",    no_argument,       nullptr, 1},
         {"benchmark",  no_argument,       nullptr, 2},
@@ -77,6 +79,7 @@ int main(int argc, char* argv[]) {
             case 1: cfg.fp16 = false; break;
             case 2: cfg.benchmark = true; break;
             case 3: cfg.resetInterval = atoi(optarg); break;
+            case 4: cfg.despillStrength = atof(optarg); break;
             case 'h':
             default:
                 printUsage(argv[0]);
@@ -96,6 +99,11 @@ int main(int argc, char* argv[]) {
     if (cfg.downsampleRatio <= 0.0f || cfg.downsampleRatio > 1.0f) {
         fprintf(stderr, "Error: downsample ratio must be in (0.0, 1.0], got %f\n",
                 cfg.downsampleRatio);
+        return 1;
+    }
+    if (cfg.despillStrength < 0.0f || cfg.despillStrength > 1.0f) {
+        fprintf(stderr, "Error: despill strength must be in [0.0, 1.0], got %f\n",
+                cfg.despillStrength);
         return 1;
     }
     if (cfg.resetInterval < 0) {
@@ -147,6 +155,8 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "  Background: RGB(%d,%d,%d)\n", cfg.bgR, cfg.bgG, cfg.bgB);
     if (cfg.alphaSmoothing < 1.0f)
         fprintf(stderr, "  Alpha smoothing: %.2f\n", cfg.alphaSmoothing);
+    if (cfg.despillStrength > 0.0f)
+        fprintf(stderr, "  Despill: %.2f\n", cfg.despillStrength);
     if (cfg.resetInterval > 0)
         fprintf(stderr, "  Recurrent reset: every %d frames\n", cfg.resetInterval);
 

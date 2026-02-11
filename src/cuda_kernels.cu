@@ -91,6 +91,62 @@ void launchAlphaEma(float* d_pha, float* d_phaPrev,
 }
 
 // ---------------------------------------------------------------------------
+// Despill: suppress background color contamination at semi-transparent edges
+// ---------------------------------------------------------------------------
+__global__ void despillKernel(float* __restrict__ fgr,
+                               const float* __restrict__ pha,
+                               int width, int height,
+                               float bgR, float bgG, float bgB,
+                               float strength) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    int idx = y * width + x;
+    float alpha = pha[idx];
+
+    // Only process semi-transparent pixels (edges)
+    if (alpha >= 0.95f || alpha <= 0.05f) return;
+
+    int ps = width * height;
+    float r = fgr[0 * ps + idx];
+    float g = fgr[1 * ps + idx];
+    float b = fgr[2 * ps + idx];
+
+    float limit;
+    if (bgG > bgR && bgG > bgB) {
+        // Green-dominant background: suppress green spill
+        limit = fmaxf(r, b);
+        if (g > limit)
+            g = limit + (g - limit) * (1.0f - strength);
+    } else if (bgB > bgR && bgB > bgG) {
+        // Blue-dominant background: suppress blue spill
+        limit = fmaxf(r, g);
+        if (b > limit)
+            b = limit + (b - limit) * (1.0f - strength);
+    } else {
+        // Red-dominant background: suppress red spill
+        limit = fmaxf(g, b);
+        if (r > limit)
+            r = limit + (r - limit) * (1.0f - strength);
+    }
+
+    fgr[0 * ps + idx] = r;
+    fgr[1 * ps + idx] = g;
+    fgr[2 * ps + idx] = b;
+}
+
+void launchDespill(float* d_fgr, const float* d_pha,
+                   int width, int height,
+                   float bgR, float bgG, float bgB,
+                   float strength, cudaStream_t stream) {
+    dim3 block(32, 8);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    despillKernel<<<grid, block, 0, stream>>>(d_fgr, d_pha, width, height,
+                                               bgR, bgG, bgB, strength);
+}
+
+// ---------------------------------------------------------------------------
 // Composite FGR+PHA → YUYV (float32 inputs)
 // Processes 2 horizontal pixels per thread (YUYV macro-pixel).
 // ---------------------------------------------------------------------------

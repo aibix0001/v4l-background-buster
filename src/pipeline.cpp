@@ -452,6 +452,14 @@ bool Pipeline::processFrame() {
         }
     }
 
+    // 3d. Despill: suppress background color contamination at edges
+    if (cfg_.despillStrength > 0.0f) {
+        launchDespill(d_fgr_, d_pha_, cfg_.width, cfg_.height,
+                      cfg_.bgR / 255.0f, cfg_.bgG / 255.0f, cfg_.bgB / 255.0f,
+                      cfg_.despillStrength, stream_);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     // 4. Composite + color convert
     launchCompositeToYuyv(d_fgr_, d_pha_, d_outputYuyv_,
                           cfg_.width, cfg_.height,

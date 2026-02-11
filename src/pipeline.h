@@ -22,6 +22,7 @@ struct PipelineConfig {
     float downsampleRatio = 0.5f;
     uint8_t bgR = 0, bgG = 177, bgB = 64;  // green screen default
     float alphaSmoothing = 1.0f;  // 1.0 = no smoothing
+    float despillStrength = 0.8f; // 0.0 = off, 1.0 = full suppression
     int resetInterval = 300;     // zero recurrent states every N frames (0 = disable)
     bool benchmark = false;
 };
