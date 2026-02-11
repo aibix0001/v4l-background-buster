@@ -431,7 +431,14 @@ bool Pipeline::processFrame() {
     }
     recIdx_ = next;
 
-    // 3b. Alpha temporal smoothing
+    // 3b. Periodic recurrent state reset to prevent drift
+    if (cfg_.resetInterval > 0 && ++framesSinceReset_ >= cfg_.resetInterval) {
+        for (int i = 0; i < 4; i++)
+            cudaMemsetAsync(d_rec_[recIdx_][i], 0, recDims_[i].bytes, stream_);
+        framesSinceReset_ = 0;
+    }
+
+    // 3c. Alpha temporal smoothing
     if (cfg_.alphaSmoothing < 1.0f) {
         if (firstFrame_) {
             CUDA_CHECK(cudaMemcpyAsync(d_phaPrev_, d_pha_,

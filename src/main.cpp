@@ -24,6 +24,7 @@ static void printUsage(const char* prog) {
         "  -b, --background MODE     green|color (default: green)\n"
         "  -c, --color R,G,B         Background color for 'color' mode\n"
         "  -s, --smooth FACTOR       Alpha temporal smoothing (0.0-1.0, default: 1.0=off)\n"
+        "      --reset-interval N    Zero recurrent states every N frames (default: 300, 0=off)\n"
         "      --no-fp16             Disable FP16 (use FP32)\n"
         "      --benchmark           Print per-frame timing stats\n"
         "  -h, --help                Show this help\n",
@@ -44,6 +45,7 @@ int main(int argc, char* argv[]) {
         {"background", required_argument, nullptr, 'b'},
         {"color",      required_argument, nullptr, 'c'},
         {"smooth",     required_argument, nullptr, 's'},
+        {"reset-interval", required_argument, nullptr, 3},
         {"no-fp16",    no_argument,       nullptr, 1},
         {"benchmark",  no_argument,       nullptr, 2},
         {"help",       no_argument,       nullptr, 'h'},
@@ -74,6 +76,7 @@ int main(int argc, char* argv[]) {
             case 's': cfg.alphaSmoothing = atof(optarg); break;
             case 1: cfg.fp16 = false; break;
             case 2: cfg.benchmark = true; break;
+            case 3: cfg.resetInterval = atoi(optarg); break;
             case 'h':
             default:
                 printUsage(argv[0]);
@@ -93,6 +96,10 @@ int main(int argc, char* argv[]) {
     if (cfg.downsampleRatio <= 0.0f || cfg.downsampleRatio > 1.0f) {
         fprintf(stderr, "Error: downsample ratio must be in (0.0, 1.0], got %f\n",
                 cfg.downsampleRatio);
+        return 1;
+    }
+    if (cfg.resetInterval < 0) {
+        fprintf(stderr, "Error: reset-interval must be >= 0, got %d\n", cfg.resetInterval);
         return 1;
     }
     if (cfg.alphaSmoothing <= 0.0f || cfg.alphaSmoothing > 1.0f) {
@@ -140,6 +147,8 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "  Background: RGB(%d,%d,%d)\n", cfg.bgR, cfg.bgG, cfg.bgB);
     if (cfg.alphaSmoothing < 1.0f)
         fprintf(stderr, "  Alpha smoothing: %.2f\n", cfg.alphaSmoothing);
+    if (cfg.resetInterval > 0)
+        fprintf(stderr, "  Recurrent reset: every %d frames\n", cfg.resetInterval);
 
     Pipeline pipeline(cfg);
     if (!pipeline.init()) {

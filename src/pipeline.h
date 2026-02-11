@@ -22,6 +22,7 @@ struct PipelineConfig {
     float downsampleRatio = 0.5f;
     uint8_t bgR = 0, bgG = 177, bgB = 64;  // green screen default
     float alphaSmoothing = 1.0f;  // 1.0 = no smoothing
+    int resetInterval = 300;     // zero recurrent states every N frames (0 = disable)
     bool benchmark = false;
 };
 
@@ -99,6 +100,7 @@ private:
     // Recurrent states: ping-pong buffers [2 sets][4 states] (float32)
     float* d_rec_[2][4] = {};
     int recIdx_ = 0;
+    int framesSinceReset_ = 0;
 
     struct RecDim { int ch; int h; int w; size_t bytes; };
     RecDim recDims_[4] = {};
