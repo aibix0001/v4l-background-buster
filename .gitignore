@@ -1,0 +1,29 @@
+# Planning artefacts
+PLANS/
+
+# Build
+build/
+*.o
+*.d
+*.so
+*.a
+
+# TensorRT engine files (GPU-specific, must be regenerated)
+*.plan
+*.engine
+
+# Models (large binary files)
+models/*.onnx
+models/*.plan
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+compile_commands.json
+
+# OS
+.DS_Store
+Thumbs.db
