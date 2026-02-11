@@ -145,28 +145,34 @@ bool Pipeline::processFrame() {
 
     // 2. Decode and upload
     if (captureFmt_ == V4L2_PIX_FMT_MJPEG) {
-        auto* jpegBuf = const_cast<uint8_t*>(mmapPtr);
+        // F14: Copy JPEG data to h_output_ (unused until step 5) to avoid
+        // const_cast on the mmap'd V4L2 buffer. Requeue mmap buffer early.
+        if (frameSize > yuyvBytes_) {
+            fprintf(stderr, "MJPEG frame too large: %zu > %zu — skipping\n", frameSize, yuyvBytes_);
+            capture_.requeueBuffer();
+            return true;
+        }
+        memcpy(h_output_, mmapPtr, frameSize);
+        capture_.requeueBuffer();
+
+        auto* jpegBuf = h_output_;
         int jpegSubsamp, jpegW, jpegH;
         if (tjDecompressHeader2(tjHandle_, jpegBuf, frameSize,
                                 &jpegW, &jpegH, &jpegSubsamp) != 0) {
             // Corrupt JPEG frame — skip it (common on first frames)
-            capture_.requeueBuffer();
             return true;  // not fatal, just skip
         }
         // F5: Validate JPEG dimensions match expected resolution
         if (jpegW != cfg_.width || jpegH != cfg_.height) {
             fprintf(stderr, "JPEG frame size mismatch: got %dx%d, expected %dx%d — skipping\n",
                     jpegW, jpegH, cfg_.width, cfg_.height);
-            capture_.requeueBuffer();
             return true;  // skip, not fatal
         }
         if (tjDecompress2(tjHandle_, jpegBuf, frameSize,
                           h_rgb_, cfg_.width, 0, cfg_.height,
                           TJPF_RGB, TJFLAG_FASTDCT) != 0) {
-            capture_.requeueBuffer();
             return true;  // skip corrupt frame
         }
-        capture_.requeueBuffer();
 
         CUDA_CHECK(cudaMemcpyAsync(d_inputRgb_, h_rgb_, rgbBytes_,
                                    cudaMemcpyHostToDevice, stream_));
@@ -219,6 +225,12 @@ bool Pipeline::processFrame() {
     // 5. Download and write
     CUDA_CHECK(cudaMemcpyAsync(h_output_, d_outputYuyv_, yuyvBytes_,
                                cudaMemcpyDeviceToHost, stream_));
+
+    // F18: Record stop event before sync so timing measures GPU pipeline only,
+    // not the write() syscall or CPU sync overhead
+    if (cfg_.benchmark)
+        cudaEventRecord(evStop_, stream_);
+
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     if (!output_->writeFrame(h_output_, yuyvBytes_)) {
         fprintf(stderr, "Failed to write frame to output device\n");
@@ -226,7 +238,6 @@ bool Pipeline::processFrame() {
     }
 
     if (cfg_.benchmark) {
-        cudaEventRecord(evStop_, stream_);
         cudaEventSynchronize(evStop_);
         cudaEventElapsedTime(&lastFrameMs_, evStart_, evStop_);
     }
