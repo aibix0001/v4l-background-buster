@@ -141,6 +141,7 @@ int main(int argc, char* argv[]) {
 
     long frameCount = 0;
     float totalMs = 0.0f;
+    float totalWallMs = 0.0f;
 
     while (g_running) {
         if (!pipeline.processFrame()) {
@@ -151,19 +152,23 @@ int main(int argc, char* argv[]) {
 
         if (cfg.benchmark) {
             float ms = pipeline.lastFrameMs();
+            float wallMs = pipeline.lastWallMs();
             totalMs += ms;
+            totalWallMs += wallMs;
             if (frameCount % 100 == 0) {
-                fprintf(stderr, "Frame %ld: %.2f ms (avg: %.2f ms, %.1f FPS)\n",
-                        frameCount, ms, totalMs / frameCount,
-                        1000.0f * frameCount / totalMs);
+                fprintf(stderr, "Frame %ld: GPU %.2f ms, wall %.2f ms (avg GPU: %.2f ms, wall: %.2f ms, %.1f FPS)\n",
+                        frameCount, ms, wallMs, totalMs / frameCount,
+                        totalWallMs / frameCount,
+                        1000.0f * frameCount / totalWallMs);
             }
         }
     }
 
     fprintf(stderr, "\nStopping after %ld frames\n", frameCount);
     if (cfg.benchmark && frameCount > 0) {
-        fprintf(stderr, "Average: %.2f ms/frame (%.1f FPS)\n",
-                totalMs / frameCount, 1000.0f * frameCount / totalMs);
+        fprintf(stderr, "Average GPU: %.2f ms/frame, wall: %.2f ms/frame (%.1f FPS)\n",
+                totalMs / frameCount, totalWallMs / frameCount,
+                1000.0f * frameCount / totalWallMs);
     }
 
     return 0;

@@ -19,6 +19,10 @@ public:
     // Dequeue a frame buffer. Returns pointer to mmap'd data, sets outSize.
     // Caller must call requeueBuffer() after consuming the frame.
     const uint8_t* dequeueFrame(size_t& outSize);
+
+    // Dequeue the latest frame, draining any stale buffered frames.
+    const uint8_t* dequeueLatestFrame(size_t& outSize);
+
     void requeueBuffer();
 
     int width() const { return width_; }

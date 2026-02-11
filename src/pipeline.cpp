@@ -2,6 +2,7 @@
 #include "cuda_kernels.h"
 #include <cstdio>
 #include <cstring>
+#include <time.h>
 #include <linux/videodev2.h>
 
 #define CUDA_CHECK(call) do { \
@@ -102,8 +103,12 @@ bool Pipeline::allocateGpuMemory() {
     CUDA_CHECK(cudaHostAlloc(&h_rgb_, rgbBytes_, cudaHostAllocDefault));
     CUDA_CHECK(cudaHostAlloc(&h_output_, yuyvBytes_, cudaHostAllocDefault));
 
-    CUDA_CHECK(cudaMalloc(&d_inputRgb_, rgbBytes_));
-    CUDA_CHECK(cudaMalloc(&d_inputYuyv_, yuyvBytes_));
+    // #14: Only allocate the input buffer needed for the negotiated format
+    if (captureFmt_ == V4L2_PIX_FMT_MJPEG) {
+        CUDA_CHECK(cudaMalloc(&d_inputRgb_, rgbBytes_));
+    } else {
+        CUDA_CHECK(cudaMalloc(&d_inputYuyv_, yuyvBytes_));
+    }
     CUDA_CHECK(cudaMalloc(&d_src_, srcBytes));
     CUDA_CHECK(cudaMalloc(&d_fgr_, fgrBytes));
     CUDA_CHECK(cudaMalloc(&d_pha_, phaBytes));
@@ -135,12 +140,15 @@ void Pipeline::freeGpuMemory() {
 }
 
 bool Pipeline::processFrame() {
-    if (cfg_.benchmark)
+    struct timespec wallStart{}, wallEnd{};
+    if (cfg_.benchmark) {
         cudaEventRecord(evStart_, stream_);
+        clock_gettime(CLOCK_MONOTONIC, &wallStart);
+    }
 
-    // 1. Capture
+    // 1. Capture (#6: drain stale frames, keep latest)
     size_t frameSize = 0;
-    const uint8_t* mmapPtr = capture_.dequeueFrame(frameSize);
+    const uint8_t* mmapPtr = capture_.dequeueLatestFrame(frameSize);
     if (!mmapPtr) return false;
 
     // 2. Decode and upload
@@ -150,6 +158,10 @@ bool Pipeline::processFrame() {
         if (frameSize > yuyvBytes_) {
             fprintf(stderr, "MJPEG frame too large: %zu > %zu — skipping\n", frameSize, yuyvBytes_);
             capture_.requeueBuffer();
+            if (++consecutiveSkips_ > 30) {
+                fprintf(stderr, "Too many consecutive skipped frames (%d), aborting\n", consecutiveSkips_);
+                return false;
+            }
             return true;
         }
         memcpy(h_output_, mmapPtr, frameSize);
@@ -160,17 +172,29 @@ bool Pipeline::processFrame() {
         if (tjDecompressHeader2(tjHandle_, jpegBuf, frameSize,
                                 &jpegW, &jpegH, &jpegSubsamp) != 0) {
             // Corrupt JPEG frame — skip it (common on first frames)
+            if (++consecutiveSkips_ > 30) {
+                fprintf(stderr, "Too many consecutive corrupt frames (%d), aborting\n", consecutiveSkips_);
+                return false;
+            }
             return true;  // not fatal, just skip
         }
         // F5: Validate JPEG dimensions match expected resolution
         if (jpegW != cfg_.width || jpegH != cfg_.height) {
             fprintf(stderr, "JPEG frame size mismatch: got %dx%d, expected %dx%d — skipping\n",
                     jpegW, jpegH, cfg_.width, cfg_.height);
+            if (++consecutiveSkips_ > 30) {
+                fprintf(stderr, "Too many consecutive skipped frames (%d), aborting\n", consecutiveSkips_);
+                return false;
+            }
             return true;  // skip, not fatal
         }
         if (tjDecompress2(tjHandle_, jpegBuf, frameSize,
                           h_rgb_, cfg_.width, 0, cfg_.height,
                           TJPF_RGB, TJFLAG_FASTDCT) != 0) {
+            if (++consecutiveSkips_ > 30) {
+                fprintf(stderr, "Too many consecutive corrupt frames (%d), aborting\n", consecutiveSkips_);
+                return false;
+            }
             return true;  // skip corrupt frame
         }
 
@@ -183,6 +207,10 @@ bool Pipeline::processFrame() {
         if (frameSize > yuyvBytes_) {
             fprintf(stderr, "YUYV frame too large: %zu > %zu — skipping\n", frameSize, yuyvBytes_);
             capture_.requeueBuffer();
+            if (++consecutiveSkips_ > 30) {
+                fprintf(stderr, "Too many consecutive skipped frames (%d), aborting\n", consecutiveSkips_);
+                return false;
+            }
             return true;
         }
         memcpy(h_rgb_, mmapPtr, frameSize);
@@ -193,6 +221,9 @@ bool Pipeline::processFrame() {
         launchYuyvToRgbFp32(d_inputYuyv_, d_src_, cfg_.width, cfg_.height, stream_);
         CUDA_CHECK(cudaGetLastError());  // F9: check kernel launch
     }
+
+    // Successfully decoded a frame — reset skip counter
+    consecutiveSkips_ = 0;
 
     // 3. TensorRT inference
     auto* ctx = engine_.context();
@@ -240,6 +271,9 @@ bool Pipeline::processFrame() {
     if (cfg_.benchmark) {
         cudaEventSynchronize(evStop_);
         cudaEventElapsedTime(&lastFrameMs_, evStart_, evStop_);
+        clock_gettime(CLOCK_MONOTONIC, &wallEnd);
+        lastWallMs_ = (wallEnd.tv_sec - wallStart.tv_sec) * 1000.0f
+                     + (wallEnd.tv_nsec - wallStart.tv_nsec) / 1e6f;
     }
 
     return true;

@@ -32,6 +32,7 @@ public:
     bool processFrame();  // returns false on fatal error
 
     float lastFrameMs() const { return lastFrameMs_; }
+    float lastWallMs() const { return lastWallMs_; }
 
 private:
     PipelineConfig cfg_;
@@ -66,7 +67,10 @@ private:
     size_t rgbBytes_ = 0;
     size_t yuyvBytes_ = 0;
 
+    int consecutiveSkips_ = 0;  // #10: track consecutive corrupt frames
+
     float lastFrameMs_ = 0.0f;
+    float lastWallMs_ = 0.0f;
     cudaEvent_t evStart_ = nullptr, evStop_ = nullptr;
 
     bool allocateGpuMemory();

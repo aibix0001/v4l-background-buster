@@ -34,6 +34,11 @@ bool V4L2Output::init() {
     fmt.fmt.pix.pixelformat = pixfmt_;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
 
+    // #7: Set colorspace metadata for correct YUV interpretation
+    fmt.fmt.pix.colorspace = V4L2_COLORSPACE_SMPTE170M;
+    fmt.fmt.pix.ycbcr_enc = V4L2_YCBCR_ENC_601;
+    fmt.fmt.pix.quantization = V4L2_QUANTIZATION_LIM_RANGE;
+
     // F17: Calculate sizeimage with overflow-safe cast
     if (pixfmt_ == V4L2_PIX_FMT_YUYV)
         fmt.fmt.pix.sizeimage = static_cast<uint32_t>(width_) * height_ * 2;

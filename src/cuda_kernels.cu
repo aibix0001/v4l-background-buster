@@ -19,9 +19,10 @@ __global__ void yuyvToRgbFp32Kernel(const uint8_t* __restrict__ yuyv,
     uint8_t U = yuyv[byteOff + 1];
     uint8_t V = yuyv[byteOff + 3];
 
-    float fY = static_cast<float>(Y);
-    float fU = static_cast<float>(U) - 128.0f;
-    float fV = static_cast<float>(V) - 128.0f;
+    // #8: Limited-range BT.601 conversion (Y: 16-235, UV: 16-240)
+    float fY = (static_cast<float>(Y) - 16.0f) * (255.0f / 219.0f);
+    float fU = (static_cast<float>(U) - 128.0f) * (255.0f / 224.0f);
+    float fV = (static_cast<float>(V) - 128.0f) * (255.0f / 224.0f);
 
     float R = fminf(fmaxf(fY + 1.402f * fV, 0.0f), 255.0f) / 255.0f;
     float G = fminf(fmaxf(fY - 0.344136f * fU - 0.714136f * fV, 0.0f), 255.0f) / 255.0f;

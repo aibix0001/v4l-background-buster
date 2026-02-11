@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -26,7 +27,7 @@ V4L2Capture::~V4L2Capture() {
 }
 
 bool V4L2Capture::init() {
-    fd_ = open(device_.c_str(), O_RDWR);
+    fd_ = open(device_.c_str(), O_RDWR | O_NONBLOCK);
     if (fd_ < 0) {
         fprintf(stderr, "Cannot open %s: %s\n", device_.c_str(), strerror(errno));
         return false;
@@ -59,6 +60,15 @@ bool V4L2Capture::init() {
     for (auto pf : tryFormats) {
         fmt.fmt.pix.pixelformat = pf;
         if (xioctl(fd_, VIDIOC_S_FMT, &fmt) == 0) {
+            // #4: Verify driver actually accepted the requested format
+            if (fmt.fmt.pix.pixelformat != pf) {
+                char req4[5] = {}, got4[5] = {};
+                memcpy(req4, &pf, 4);
+                memcpy(got4, &fmt.fmt.pix.pixelformat, 4);
+                fprintf(stderr, "Driver substituted format %s instead of %s, trying next\n",
+                        got4, req4);
+                continue;
+            }
             formatSet = true;
             break;
         }
@@ -76,6 +86,19 @@ bool V4L2Capture::init() {
     height_ = fmt.fmt.pix.height;
     pixfmt_ = fmt.fmt.pix.pixelformat;
     frameSize_ = fmt.fmt.pix.sizeimage;
+
+    // #5: Negotiate frame rate (request 60fps)
+    v4l2_streamparm parm{};
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    parm.parm.capture.timeperframe.numerator = 1;
+    parm.parm.capture.timeperframe.denominator = 60;
+    if (xioctl(fd_, VIDIOC_S_PARM, &parm) == 0) {
+        auto& tf = parm.parm.capture.timeperframe;
+        float fps = (tf.numerator > 0) ? static_cast<float>(tf.denominator) / tf.numerator : 0;
+        fprintf(stderr, "Frame rate: %.1f fps (requested 60)\n", fps);
+    } else {
+        fprintf(stderr, "Frame rate negotiation not supported by driver\n");
+    }
 
     // F8: Reject odd widths (YUYV and other packed formats require even width)
     if (width_ % 2 != 0) {
@@ -150,14 +173,39 @@ void V4L2Capture::stopStreaming() {
 }
 
 const uint8_t* V4L2Capture::dequeueFrame(size_t& outSize) {
+    // #3: poll() before DQBUF to avoid infinite hang on USB disconnect
+    struct pollfd pfd{};
+    pfd.fd = fd_;
+    pfd.events = POLLIN;
+    int ret = poll(&pfd, 1, 2000);  // 2-second timeout
+    if (ret <= 0) {
+        if (ret == 0)
+            fprintf(stderr, "poll() timeout — camera not responding\n");
+        else
+            fprintf(stderr, "poll() failed: %s\n", strerror(errno));
+        outSize = 0;
+        return nullptr;
+    }
+
     v4l2_buffer buf{};
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
-    if (xioctl(fd_, VIDIOC_DQBUF, &buf) < 0) {
+
+    // #15: Retry on EAGAIN and transient EIO
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (xioctl(fd_, VIDIOC_DQBUF, &buf) == 0)
+            break;
+        if (errno == EAGAIN)
+            continue;
+        if (errno == EIO && attempt < 2) {
+            fprintf(stderr, "VIDIOC_DQBUF EIO (transient USB error), retrying\n");
+            continue;
+        }
         fprintf(stderr, "VIDIOC_DQBUF failed: %s\n", strerror(errno));
         outSize = 0;
         return nullptr;
     }
+
     // F3: Validate buf.index before accessing buffers_
     if (buf.index >= buffers_.size()) {
         fprintf(stderr, "VIDIOC_DQBUF returned invalid index %u (have %zu buffers)\n",
@@ -168,6 +216,33 @@ const uint8_t* V4L2Capture::dequeueFrame(size_t& outSize) {
     currentBufIndex_ = buf.index;
     outSize = buf.bytesused;
     return static_cast<const uint8_t*>(buffers_[buf.index].start);
+}
+
+const uint8_t* V4L2Capture::dequeueLatestFrame(size_t& outSize) {
+    // #6: Drain stale frames, keeping only the newest
+    const uint8_t* latest = dequeueFrame(outSize);
+    if (!latest) return nullptr;
+
+    // Attempt additional non-blocking DQBUFs to drain stale frames
+    for (;;) {
+        v4l2_buffer buf{};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        if (xioctl(fd_, VIDIOC_DQBUF, &buf) < 0)
+            break;  // EAGAIN = no more frames queued
+
+        if (buf.index >= buffers_.size())
+            break;
+
+        // Requeue the older frame we were holding
+        requeueBuffer();
+
+        // Keep this newer frame
+        currentBufIndex_ = buf.index;
+        outSize = buf.bytesused;
+        latest = static_cast<const uint8_t*>(buffers_[buf.index].start);
+    }
+    return latest;
 }
 
 void V4L2Capture::requeueBuffer() {
