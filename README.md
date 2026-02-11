@@ -144,7 +144,7 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc)
   -s, --smooth FACTOR       Alpha temporal smoothing (0.0-1.0, default: 1.0=off)
       --despill STRENGTH    Suppress bg color fringe (0.0-1.0, default: 0.8, 0=off)
       --no-refine           Disable guided filter alpha refinement
-      --reset-interval N    Zero recurrent states every N frames (default: 300, 0=off)
+      --reset-interval N    Zero recurrent states every N frames (default: 100, 0=off)
       --no-fp16             Disable FP16 (use FP32 throughout)
       --benchmark           Print per-frame GPU and wall timing every 100 frames
   -h, --help                Show help
