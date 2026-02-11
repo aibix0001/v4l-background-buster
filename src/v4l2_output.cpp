@@ -34,13 +34,13 @@ bool V4L2Output::init() {
     fmt.fmt.pix.pixelformat = pixfmt_;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
 
-    // Calculate sizeimage based on format
+    // F17: Calculate sizeimage with overflow-safe cast
     if (pixfmt_ == V4L2_PIX_FMT_YUYV)
-        fmt.fmt.pix.sizeimage = width_ * height_ * 2;
+        fmt.fmt.pix.sizeimage = static_cast<uint32_t>(width_) * height_ * 2;
     else if (pixfmt_ == V4L2_PIX_FMT_BGR32 || pixfmt_ == V4L2_PIX_FMT_RGB32)
-        fmt.fmt.pix.sizeimage = width_ * height_ * 4;
+        fmt.fmt.pix.sizeimage = static_cast<uint32_t>(width_) * height_ * 4;
     else
-        fmt.fmt.pix.sizeimage = width_ * height_ * 2;
+        fmt.fmt.pix.sizeimage = static_cast<uint32_t>(width_) * height_ * 2;
 
     if (xioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) {
         fprintf(stderr, "VIDIOC_S_FMT on output failed: %s\n", strerror(errno));
@@ -55,6 +55,11 @@ bool V4L2Output::writeFrame(const uint8_t* data, size_t size) {
     ssize_t written = write(fd_, data, size);
     if (written < 0) {
         fprintf(stderr, "write to output failed: %s\n", strerror(errno));
+        return false;
+    }
+    // F13: Check for partial write
+    if (static_cast<size_t>(written) != size) {
+        fprintf(stderr, "partial write to output: %zd of %zu bytes\n", written, size);
         return false;
     }
     return true;

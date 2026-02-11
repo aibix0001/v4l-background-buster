@@ -77,6 +77,12 @@ bool V4L2Capture::init() {
     pixfmt_ = fmt.fmt.pix.pixelformat;
     frameSize_ = fmt.fmt.pix.sizeimage;
 
+    // F8: Reject odd widths (YUYV and other packed formats require even width)
+    if (width_ % 2 != 0) {
+        fprintf(stderr, "Negotiated width %d is odd — not supported (must be even)\n", width_);
+        return false;
+    }
+
     char fourcc[5] = {};
     memcpy(fourcc, &pixfmt_, 4);
     fprintf(stderr, "Capture: %dx%d, format=%s, frameSize=%zu\n",
@@ -149,6 +155,13 @@ const uint8_t* V4L2Capture::dequeueFrame(size_t& outSize) {
     buf.memory = V4L2_MEMORY_MMAP;
     if (xioctl(fd_, VIDIOC_DQBUF, &buf) < 0) {
         fprintf(stderr, "VIDIOC_DQBUF failed: %s\n", strerror(errno));
+        outSize = 0;
+        return nullptr;
+    }
+    // F3: Validate buf.index before accessing buffers_
+    if (buf.index >= buffers_.size()) {
+        fprintf(stderr, "VIDIOC_DQBUF returned invalid index %u (have %zu buffers)\n",
+                buf.index, buffers_.size());
         outSize = 0;
         return nullptr;
     }

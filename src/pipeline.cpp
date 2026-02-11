@@ -73,7 +73,13 @@ bool Pipeline::init() {
 bool Pipeline::allocateGpuMemory() {
     int W = cfg_.width;
     int H = cfg_.height;
-    int pixels = W * H;
+
+    // F2: Validate dimensions and use size_t arithmetic to prevent overflow
+    if (W < 1 || W > 8192 || H < 1 || H > 8192) {
+        fprintf(stderr, "Invalid dimensions %dx%d (must be 1..8192)\n", W, H);
+        return false;
+    }
+    size_t pixels = static_cast<size_t>(W) * H;
 
     rgbBytes_ = pixels * 3;
     yuyvBytes_ = pixels * 2;
@@ -147,6 +153,13 @@ bool Pipeline::processFrame() {
             capture_.requeueBuffer();
             return true;  // not fatal, just skip
         }
+        // F5: Validate JPEG dimensions match expected resolution
+        if (jpegW != cfg_.width || jpegH != cfg_.height) {
+            fprintf(stderr, "JPEG frame size mismatch: got %dx%d, expected %dx%d — skipping\n",
+                    jpegW, jpegH, cfg_.width, cfg_.height);
+            capture_.requeueBuffer();
+            return true;  // skip, not fatal
+        }
         if (tjDecompress2(tjHandle_, jpegBuf, frameSize,
                           h_rgb_, cfg_.width, 0, cfg_.height,
                           TJPF_RGB, TJFLAG_FASTDCT) != 0) {
@@ -158,13 +171,21 @@ bool Pipeline::processFrame() {
         CUDA_CHECK(cudaMemcpyAsync(d_inputRgb_, h_rgb_, rgbBytes_,
                                    cudaMemcpyHostToDevice, stream_));
         launchRgbToFp32(d_inputRgb_, d_src_, cfg_.width, cfg_.height, stream_);
+        CUDA_CHECK(cudaGetLastError());  // F9: check kernel launch
     } else {
+        // F4: Validate frame size before memcpy
+        if (frameSize > yuyvBytes_) {
+            fprintf(stderr, "YUYV frame too large: %zu > %zu — skipping\n", frameSize, yuyvBytes_);
+            capture_.requeueBuffer();
+            return true;
+        }
         memcpy(h_rgb_, mmapPtr, frameSize);
         capture_.requeueBuffer();
 
         CUDA_CHECK(cudaMemcpyAsync(d_inputYuyv_, h_rgb_, yuyvBytes_,
                                    cudaMemcpyHostToDevice, stream_));
         launchYuyvToRgbFp32(d_inputYuyv_, d_src_, cfg_.width, cfg_.height, stream_);
+        CUDA_CHECK(cudaGetLastError());  // F9: check kernel launch
     }
 
     // 3. TensorRT inference
@@ -193,12 +214,16 @@ bool Pipeline::processFrame() {
     launchCompositeToYuyv(d_fgr_, d_pha_, d_outputYuyv_,
                           cfg_.width, cfg_.height,
                           cfg_.bgR, cfg_.bgG, cfg_.bgB, stream_);
+    CUDA_CHECK(cudaGetLastError());  // F9: check kernel launch
 
     // 5. Download and write
     CUDA_CHECK(cudaMemcpyAsync(h_output_, d_outputYuyv_, yuyvBytes_,
                                cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
-    output_->writeFrame(h_output_, yuyvBytes_);
+    if (!output_->writeFrame(h_output_, yuyvBytes_)) {
+        fprintf(stderr, "Failed to write frame to output device\n");
+        return false;
+    }
 
     if (cfg_.benchmark) {
         cudaEventRecord(evStop_, stream_);

@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <getopt.h>
+#include <string>
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -63,7 +64,10 @@ int main(int argc, char* argv[]) {
                 }
                 break;
             case 'c':
-                sscanf(optarg, "%hhu,%hhu,%hhu", &cfg.bgR, &cfg.bgG, &cfg.bgB);
+                if (sscanf(optarg, "%hhu,%hhu,%hhu", &cfg.bgR, &cfg.bgG, &cfg.bgB) != 3) {
+                    fprintf(stderr, "Error: --color requires R,G,B format (e.g. 0,177,64)\n");
+                    return 1;
+                }
                 break;
             case 1: cfg.fp16 = false; break;
             case 2: cfg.benchmark = true; break;
@@ -74,9 +78,50 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Register signal handlers for clean shutdown
-    signal(SIGINT, signalHandler);
-    signal(SIGTERM, signalHandler);
+    // F6: Validate width, height, downsample ratio
+    if (cfg.width < 1 || cfg.width > 8192) {
+        fprintf(stderr, "Error: width must be in range [1, 8192], got %d\n", cfg.width);
+        return 1;
+    }
+    if (cfg.height < 1 || cfg.height > 8192 || cfg.height % 2 != 0) {
+        fprintf(stderr, "Error: height must be even and in range [2, 8192], got %d\n", cfg.height);
+        return 1;
+    }
+    if (cfg.downsampleRatio <= 0.0f || cfg.downsampleRatio > 1.0f) {
+        fprintf(stderr, "Error: downsample ratio must be in (0.0, 1.0], got %f\n",
+                cfg.downsampleRatio);
+        return 1;
+    }
+
+    // F10: Validate device paths
+    auto isValidDevicePath = [](const std::string& path) {
+        return path.rfind("/dev/video", 0) == 0 || path.rfind("/dev/v4l", 0) == 0;
+    };
+    if (!isValidDevicePath(cfg.inputDevice)) {
+        fprintf(stderr, "Error: input device must start with /dev/video or /dev/v4l, got '%s'\n",
+                cfg.inputDevice.c_str());
+        return 1;
+    }
+    if (!isValidDevicePath(cfg.outputDevice)) {
+        fprintf(stderr, "Error: output device must start with /dev/video or /dev/v4l, got '%s'\n",
+                cfg.outputDevice.c_str());
+        return 1;
+    }
+
+    // F11: Reject engine path with ".." segments
+    if (cfg.planPath.find("..") != std::string::npos) {
+        fprintf(stderr, "Error: engine path must not contain '..' segments, got '%s'\n",
+                cfg.planPath.c_str());
+        return 1;
+    }
+
+    // Register signal handlers for clean shutdown (F12: use sigaction)
+    struct sigaction sa{};
+    sa.sa_handler = signalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
     fprintf(stderr, "v4l-background-buster starting...\n");
     fprintf(stderr, "  Input:  %s\n", cfg.inputDevice.c_str());

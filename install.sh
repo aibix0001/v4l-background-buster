@@ -167,7 +167,8 @@ if [ "$SKIP_MODEL" = false ]; then
         # 2. Set up Python venv
         if ! check_cmd uv; then
             info "Installing uv (Python package manager)"
-            curl -LsSf https://astral.sh/uv/install.sh | sh
+            # F15: Pin to specific version instead of latest
+            curl -LsSf https://astral.sh/uv/0.6.2/install.sh | sh
             export PATH="$HOME/.local/bin:$PATH"
         fi
 

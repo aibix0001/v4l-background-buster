@@ -28,7 +28,9 @@ bool TrtEngine::loadOrBuild(const std::string& onnxPath, const std::string& plan
     // Try loading cached plan first
     std::ifstream planFile(planPath, std::ios::binary | std::ios::ate);
     if (planFile.good() && planFile.tellg() > 0) {
-        fprintf(stderr, "Loading cached TensorRT engine from %s\n", planPath.c_str());
+        // F1: Warn that plan files are untrusted binary blobs deserialized by TRT
+        fprintf(stderr, "WARNING: Loading cached TensorRT plan from %s\n", planPath.c_str());
+        fprintf(stderr, "  Plan files contain serialized GPU code. Only load plans you built yourself.\n");
         planFile.close();
         if (loadFromPlan(planPath)) {
             context_.reset(engine_->createExecutionContext());
@@ -113,10 +115,26 @@ bool TrtEngine::buildFromOnnx(const std::string& onnxPath, const std::string& pl
 
 bool TrtEngine::loadFromPlan(const std::string& planPath) {
     std::ifstream in(planPath, std::ios::binary | std::ios::ate);
-    size_t size = in.tellg();
+    // F7: Validate file is readable and non-empty
+    if (!in.good()) {
+        fprintf(stderr, "Cannot open plan file: %s\n", planPath.c_str());
+        return false;
+    }
+    auto pos = in.tellg();
+    if (pos <= 0) {
+        fprintf(stderr, "Plan file is empty or unreadable: %s\n", planPath.c_str());
+        return false;
+    }
+    size_t size = static_cast<size_t>(pos);
     in.seekg(0);
     std::vector<char> data(size);
     in.read(data.data(), size);
+    // F7: Verify read completed successfully
+    if (!in.good() || static_cast<size_t>(in.gcount()) != size) {
+        fprintf(stderr, "Failed to read plan file (read %zd of %zu bytes)\n",
+                static_cast<ssize_t>(in.gcount()), size);
+        return false;
+    }
 
     runtime_.reset(nvinfer1::createInferRuntime(logger_));
     engine_.reset(runtime_->deserializeCudaEngine(data.data(), data.size()));
