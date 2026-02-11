@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **v4l-background-buster** (working name: `rvm-vcam`) is a standalone C++ application for real-time AI-powered background removal. It captures video from a USB camera via V4L2, runs Robust Video Matting (RVM) inference using TensorRT FP16, composites the result on GPU, and outputs to a v4l2loopback virtual camera device. Any application (OBS, Discord, Zoom, Teams) can consume the output as a normal camera.
 
-**Current performance**: ~17ms/frame (~57 FPS) at 1080p on RTX 2060 Super.
+**Current performance**: ~25-30ms/frame (~33-40 FPS) at 1080p on RTX 2060 Super. Trades raw FPS for significantly better edge quality vs v0.2 (~17ms/57 FPS).
 
 ## Build & Run Commands
 
@@ -26,6 +26,7 @@ sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="AI-Camera" exclusiv
 # Run with options
 ./build/rvm-vcam -i /dev/video0 -o /dev/video10 --benchmark
 ./build/rvm-vcam --benchmark -s 0.7    # with alpha smoothing
+./build/rvm-vcam --no-refine --despill 0  # disable post-processing
 ./build/rvm-vcam -W 1280 -H 720        # 720p mode
 
 # Verify camera devices
@@ -62,7 +63,10 @@ Main thread (GPU, single CUDA stream):
   wait for slot → nvjpegDecodeJpegTransferToDevice + Device (GPU IDCT)
   → launchRgbToFp32 (preprocess) → record slotDoneEvent, release slot
   → TensorRT RVM inference (with recurrent state ping-pong)
-  → [optional] launchAlphaEma (temporal smoothing)
+  → [periodic] recurrent state reset (zero r1-r4 to prevent drift)
+  → [optional] adaptive alpha EMA (temporal smoothing)
+  → [default] guided filter (alpha refinement using RGB guide)
+  → [default] despill (suppress bg color fringe at edges)
   → launchCompositeToYuyv (alpha blend + RGB→YUYV)
   → cudaMemcpyAsync D2H → cudaStreamSynchronize → v4l2loopback write
 ```
@@ -78,7 +82,7 @@ Two `FrameSlot` structs alternate: while the GPU processes frame N, the CPU capt
 | `v4l2_capture.h/cpp` | V4L2 MMAP capture with poll timeout, stale frame draining, EIO retry |
 | `v4l2_output.h/cpp` | Frame writer to v4l2loopback with colorspace metadata |
 | `trt_engine.h/cpp` | TensorRT engine build/load/infer (ONNX→plan caching) |
-| `cuda_kernels.h/cu` | GPU kernels: YUYV→RGB, RGB→FP32, alpha EMA, composite+YUYV |
+| `cuda_kernels.h/cu` | GPU kernels: YUYV→RGB, RGB→FP32, adaptive alpha EMA, guided filter, despill, composite+YUYV |
 
 ### Key Design Decisions
 
@@ -88,7 +92,10 @@ Two `FrameSlot` structs alternate: while the GPU processes frame N, the CPU capt
 - **Recurrent state ping-pong**: RVM uses 4 recurrent states (r1-r4) that feed back each frame. Two sets of buffers swapped via pointer swap (zero-copy).
 - **Single CUDA stream**: All GPU work is serialized on one stream. Overlap is CPU-vs-GPU, not GPU-vs-GPU.
 - **Multi-resolution model support**: Model paths auto-resolved from capture resolution (e.g. `models/rvm_1080p.onnx`, `models/rvm_720p.plan`). install.sh builds models for multiple resolutions.
-- **Alpha temporal smoothing**: Optional EMA filter on alpha matte reduces flickering (`-s/--smooth`).
+- **Adaptive alpha temporal smoothing**: Optional EMA filter (`-s/--smooth`) with adaptive per-pixel strength — heavy smoothing at uncertain edges (alpha ~0.5), minimal at confident pixels (alpha ~0 or ~1), reduced on fast motion.
+- **Fast guided filter**: Alpha matte refinement using high-res RGB as guide (He & Sun 2015). Snaps soft matte edges to real image edges. Operates at 1/4 resolution for coefficient computation. On by default (`--no-refine` to disable).
+- **Despill**: CUDA kernel suppresses background color contamination in RVM's foreground output at semi-transparent edge pixels, eliminating color fringe (`--despill`, default 0.8).
+- **Recurrent state reset**: Periodic zeroing of RVM recurrent states prevents progressive color drift (`--reset-interval`, default 300 frames).
 - **V4L2 hardening**: poll() timeout before DQBUF, format verification after S_FMT, frame rate negotiation, dequeueLatestFrame() drains stale frames, DQBUF retry on EIO, consecutive skip counter.
 - **TensorRT plan files are GPU-specific and TRT-version-specific** — must be regenerated after driver or TensorRT updates.
 - **BT.601 limited-range**: YUYV→RGB uses limited-range coefficients; output sets V4L2 colorspace metadata.
@@ -100,9 +107,9 @@ Inputs:  src [1,3,H,W], r1i..r4i (recurrent)
 Outputs: fgr [1,3,H,W], pha [1,1,H,W], r1o..r4o (recurrent)
 ```
 
-Recurrent state spatial dims at downsample_ratio=0.25 (1080p, internal 270x480):
-- r1: [1,16,135,240], r2: [1,20,68,120], r3: [1,40,34,60], r4: [1,64,17,30]
+Recurrent state spatial dims at downsample_ratio=0.5 (1080p, internal 540x960):
+- r1: [1,16,270,480], r2: [1,20,135,240], r3: [1,40,68,120], r4: [1,64,34,60]
 
 ### Known TensorRT Issue
 
-`downsample_ratio` feeds into a Resize node and TRT may error about shape tensor types. Workaround: `scripts/patch_onnx.py` bakes `downsample_ratio=0.25` as a constant, then `onnxsim` folds all shape nodes to produce a static-shape model. This is handled by `install.sh`.
+`downsample_ratio` feeds into a Resize node and TRT may error about shape tensor types. Workaround: `scripts/patch_onnx.py` bakes `downsample_ratio=0.5` as a constant, then `onnxsim` folds all shape nodes to produce a static-shape model. This is handled by `install.sh`.

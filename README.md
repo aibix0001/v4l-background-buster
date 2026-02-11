@@ -6,7 +6,7 @@ A standalone C++ application that captures video from a USB camera via V4L2, run
 
 ## Status
 
-**~57 FPS at 1080p** (~17ms/frame) on an RTX 2060 Super. Double-buffered pipeline with nvJPEG GPU-hybrid JPEG decoder overlaps CPU capture with GPU inference.
+**~33-40 FPS at 1080p** (~25-30ms/frame) on an RTX 2060 Super. v0.3 trades raw FPS for significantly better edge quality — higher internal matting resolution, guided filter alpha refinement, despill, and adaptive temporal smoothing. Double-buffered pipeline with nvJPEG GPU-hybrid JPEG decoder overlaps CPU capture with GPU inference.
 
 ## How It Works
 
@@ -17,7 +17,10 @@ Capture thread (CPU):
 Main thread (GPU, single CUDA stream):
   nvJPEG GPU IDCT → preprocess (RGB→FP32 BCHW)
   → TensorRT RVM inference (FP16, recurrent states)
-  → [optional] alpha EMA smoothing
+  → [periodic] recurrent state reset (prevents drift)
+  → [optional] adaptive alpha EMA smoothing
+  → [default] guided filter alpha refinement (edge-aware)
+  → [default] despill (suppress bg color fringe)
   → composite (foreground × alpha + background)
   → color convert (RGB→YUYV BT.601)
   → v4l2loopback write → any app sees a normal camera
@@ -81,11 +84,11 @@ wget -O models/rvm_mobilenetv3_fp32.onnx \
 uv venv .venv && source .venv/bin/activate
 uv pip install onnx==1.16.2 onnx-graphsurgeon==0.5.2 onnxsim onnxruntime
 
-# Patch and simplify (1080p example)
-python scripts/patch_onnx.py models/rvm_mobilenetv3_fp32.onnx models/rvm_patched.onnx
+# Patch and simplify (1080p example, ds_ratio=0.5)
+python scripts/patch_onnx.py models/rvm_mobilenetv3_fp32.onnx models/rvm_patched.onnx 0.5
 onnxsim models/rvm_patched.onnx models/rvm_1080p.onnx \
   --overwrite-input-shape src:1,3,1080,1920 \
-    r1i:1,16,135,240 r2i:1,20,68,120 r3i:1,40,34,60 r4i:1,64,17,30
+    r1i:1,16,270,480 r2i:1,20,135,240 r3i:1,40,68,120 r4i:1,64,34,60
 
 # Build TensorRT engine (takes 2-5 minutes)
 trtexec --onnx=models/rvm_1080p.onnx --saveEngine=models/rvm_1080p.plan --fp16
@@ -110,8 +113,11 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc)
 # With benchmark timing
 ./build/rvm-vcam --benchmark
 
-# With alpha smoothing (reduces matte flickering)
+# With alpha smoothing (reduces edge flickering)
 ./build/rvm-vcam -s 0.7
+
+# Disable post-processing (raw RVM output, faster)
+./build/rvm-vcam --no-refine --despill 0
 
 # Custom background color (black)
 ./build/rvm-vcam -b color -c 0,0,0
@@ -132,10 +138,13 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc)
   -H, --height N            Frame height (default: 1080)
   -m, --model PATH          ONNX model path (default: auto from resolution)
   -e, --engine PATH         TensorRT plan cache (default: auto from resolution)
-  -d, --downsample RATIO    RVM downsample ratio (default: 0.25)
+  -d, --downsample RATIO    RVM downsample ratio (default: 0.5)
   -b, --background MODE     green|color (default: green)
   -c, --color R,G,B         Background color for 'color' mode (default: 0,177,64)
   -s, --smooth FACTOR       Alpha temporal smoothing (0.0-1.0, default: 1.0=off)
+      --despill STRENGTH    Suppress bg color fringe (0.0-1.0, default: 0.8, 0=off)
+      --no-refine           Disable guided filter alpha refinement
+      --reset-interval N    Zero recurrent states every N frames (default: 300, 0=off)
       --no-fp16             Disable FP16 (use FP32 throughout)
       --benchmark           Print per-frame GPU and wall timing every 100 frames
   -h, --help                Show help
@@ -155,12 +164,24 @@ ffplay /dev/video10
 
 Benchmarked on RTX 2060 Super with USB MJPEG capture card at 1080p:
 
-| Version | Frame time | FPS | JPEG decode |
-|---------|-----------|-----|-------------|
-| v0.1 | ~35ms | ~28 | ~15ms (libjpeg-turbo, CPU) |
-| v0.2 | ~17ms | ~57 | ~3-5ms (nvJPEG GPU-hybrid) |
+| Version | Frame time | FPS | Focus |
+|---------|-----------|-----|-------|
+| v0.1 | ~35ms | ~28 | Baseline (libjpeg-turbo CPU decode) |
+| v0.2 | ~17ms | ~57 | Speed (nvJPEG GPU-hybrid, double-buffered) |
+| v0.3 | ~25-30ms | ~33-40 | Quality (ds_ratio 0.5, guided filter, despill) |
 
-TensorRT inference alone: ~3.3ms. The double-buffered pipeline hides most of the CPU Huffman decode time behind GPU processing.
+v0.3 component breakdown (estimated):
+
+| Stage | Time |
+|-------|------|
+| nvJPEG decode | ~3-5ms |
+| RGB→FP32 preprocess | ~0.3ms |
+| TRT inference (ds=0.5) | ~10-12ms |
+| Adaptive alpha EMA | ~0.1ms |
+| Guided filter | ~3-4ms |
+| Despill | ~0.1ms |
+| Composite + YUYV | ~0.3ms |
+| D2H + write | ~1ms |
 
 ## License
 
