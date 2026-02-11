@@ -68,17 +68,35 @@ void launchRgbToFp32(const uint8_t* d_rgb_u8, float* d_rgb_fp32,
 }
 
 // ---------------------------------------------------------------------------
-// Alpha EMA temporal smoothing
+// Adaptive alpha EMA temporal smoothing
+// Edge pixels (alpha ~0.5) get heavy smoothing to reduce shimmer.
+// Confident pixels (alpha ~0 or ~1) get minimal smoothing to avoid lag.
+// Large frame-to-frame changes (motion) also reduce smoothing.
 // ---------------------------------------------------------------------------
 __global__ void alphaEmaKernel(float* __restrict__ pha,
                                 float* __restrict__ phaPrev,
-                                int width, int height, float factor) {
+                                int width, int height, float baseFactor) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
 
     int idx = y * width + x;
-    float smoothed = phaPrev[idx] * (1.0f - factor) + pha[idx] * factor;
+    float current = pha[idx];
+    float prev = phaPrev[idx];
+
+    // Confidence: how far from 0.5 (edge). Range [0, 0.5].
+    float confidence = fabsf(current - 0.5f);
+
+    // High confidence (near 0 or 1) → factor close to 1.0 (almost no smoothing)
+    // Low confidence (near 0.5, edge) → factor = baseFactor (heavy smoothing)
+    float factor = baseFactor + (1.0f - baseFactor) * confidence * 2.0f;
+
+    // Reduce smoothing on large frame-to-frame change (motion)
+    float delta = fabsf(current - prev);
+    if (delta > 0.3f)
+        factor = fminf(factor + 0.3f, 1.0f);
+
+    float smoothed = prev * (1.0f - factor) + current * factor;
     pha[idx] = smoothed;
     phaPrev[idx] = smoothed;
 }
