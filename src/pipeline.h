@@ -3,7 +3,7 @@
 #include "v4l2_output.h"
 #include "trt_engine.h"
 #include <cuda_runtime.h>
-#include <turbojpeg.h>
+#include <nvjpeg.h>
 #include <memory>
 #include <string>
 
@@ -43,7 +43,19 @@ private:
     cudaStream_t stream_ = nullptr;
     uint32_t captureFmt_ = 0;
 
-    tjhandle tjHandle_ = nullptr;
+    // nvJPEG decoupled decoder
+    nvjpegHandle_t nvjpegHandle_ = nullptr;
+    nvjpegJpegState_t nvjpegState_ = nullptr;
+    nvjpegJpegDecoder_t nvjpegDecoder_ = nullptr;
+    nvjpegJpegStream_t nvjpegStream_ = nullptr;
+    nvjpegDecodeParams_t nvjpegParams_ = nullptr;
+    nvjpegBufferPinned_t nvjpegPinnedBuf_ = nullptr;
+    nvjpegBufferDevice_t nvjpegDeviceBuf_ = nullptr;
+    nvjpegImage_t nvjpegOutput_ = {};
+
+    // Pinned staging buffer for JPEG compressed data
+    uint8_t* h_jpegStaging_ = nullptr;
+    size_t jpegStagingSize_ = 0;
 
     // Pinned host memory
     uint8_t* h_rgb_ = nullptr;

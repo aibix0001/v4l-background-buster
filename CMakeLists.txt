@@ -22,8 +22,8 @@ find_path(TENSORRT_INCLUDE_DIR NvInfer.h
 find_library(NVINFER_LIB nvinfer REQUIRED)
 find_library(NVONNXPARSER_LIB nvonnxparser REQUIRED)
 
-# libjpeg-turbo for MJPEG decode
-find_library(TURBOJPEG_LIB turbojpeg REQUIRED)
+# nvJPEG for GPU-accelerated MJPEG decode
+find_library(NVJPEG_LIB nvjpeg REQUIRED)
 
 # Executable
 add_executable(rvm-vcam
@@ -44,7 +44,7 @@ target_include_directories(rvm-vcam PRIVATE
 target_link_libraries(rvm-vcam PRIVATE
     ${NVINFER_LIB}
     ${NVONNXPARSER_LIB}
-    ${TURBOJPEG_LIB}
+    ${NVJPEG_LIB}
     CUDA::cudart
 )
 
