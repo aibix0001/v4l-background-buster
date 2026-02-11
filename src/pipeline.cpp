@@ -5,6 +5,14 @@
 #include <time.h>
 #include <linux/videodev2.h>
 
+static std::string resolveResolutionTag(int w, int h) {
+    if (w == 1920 && h == 1080) return "1080p";
+    if (w == 1280 && h == 720) return "720p";
+    if (w == 2560 && h == 1440) return "1440p";
+    if (w == 3840 && h == 2160) return "2160p";
+    return std::to_string(w) + "x" + std::to_string(h);
+}
+
 #define CUDA_CHECK(call) do { \
     cudaError_t err = (call); \
     if (err != cudaSuccess) { \
@@ -97,6 +105,18 @@ bool Pipeline::init() {
         }
         nvjpegDecodeParamsSetOutputFormat(nvjpegParams_, NVJPEG_OUTPUT_RGBI);
         fprintf(stderr, "MJPEG capture — using nvJPEG GPU-hybrid decoder\n");
+    }
+
+    // Auto-resolve model paths based on negotiated resolution
+    if (cfg_.onnxPath.empty()) {
+        std::string tag = resolveResolutionTag(cfg_.width, cfg_.height);
+        cfg_.onnxPath = "models/rvm_" + tag + ".onnx";
+        fprintf(stderr, "Auto-resolved ONNX model: %s\n", cfg_.onnxPath.c_str());
+    }
+    if (cfg_.planPath.empty()) {
+        std::string tag = resolveResolutionTag(cfg_.width, cfg_.height);
+        cfg_.planPath = "models/rvm_" + tag + ".plan";
+        fprintf(stderr, "Auto-resolved TRT plan: %s\n", cfg_.planPath.c_str());
     }
 
     output_ = std::make_unique<V4L2Output>(cfg_.outputDevice, cfg_.width, cfg_.height, V4L2_PIX_FMT_YUYV);

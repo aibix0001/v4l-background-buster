@@ -12,8 +12,8 @@ struct PipelineConfig {
     std::string outputDevice = "/dev/video10";
     int width = 1920;
     int height = 1080;
-    std::string onnxPath = "models/rvm_mobilenetv3_fp32_simplified.onnx";
-    std::string planPath = "models/rvm.plan";
+    std::string onnxPath;   // empty = auto-resolve from resolution
+    std::string planPath;   // empty = auto-resolve from resolution
     bool fp16 = true;
     float downsampleRatio = 0.25f;
     uint8_t bgR = 0, bgG = 177, bgB = 64;  // green screen default

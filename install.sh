@@ -18,7 +18,9 @@ MODEL_URL="https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0
 MODEL_DIR="models"
 MODEL_ORIG="$MODEL_DIR/rvm_mobilenetv3_fp32.onnx"
 MODEL_PATCHED="$MODEL_DIR/rvm_mobilenetv3_fp32_patched.onnx"
-MODEL_SIMPLIFIED="$MODEL_DIR/rvm_mobilenetv3_fp32_simplified.onnx"
+
+# Multi-resolution support: WxH pairs to build models for
+RESOLUTIONS=("1920x1080:1080p" "1280x720:720p")
 VENV_DIR=".venv"
 BUILD_DIR="build"
 
@@ -149,25 +151,31 @@ fi
 # ── Model preparation ────────────────────────────────────────────────────────
 
 if [ "$SKIP_MODEL" = false ]; then
-    info "Preparing RVM model"
+    info "Preparing RVM models"
     mkdir -p "$MODEL_DIR"
 
-    # 1. Download
-    if [ -f "$MODEL_SIMPLIFIED" ]; then
-        ok "Simplified model already exists: $MODEL_SIMPLIFIED"
+    # 1. Download original model
+    if [ ! -f "$MODEL_ORIG" ]; then
+        info "Downloading RVM MobileNetV3 ONNX model"
+        wget -q --show-progress -O "$MODEL_ORIG" "$MODEL_URL"
+        ok "Downloaded: $MODEL_ORIG"
     else
-        if [ ! -f "$MODEL_ORIG" ]; then
-            info "Downloading RVM MobileNetV3 ONNX model"
-            wget -q --show-progress -O "$MODEL_ORIG" "$MODEL_URL"
-            ok "Downloaded: $MODEL_ORIG"
-        else
-            ok "Original model already exists: $MODEL_ORIG"
-        fi
+        ok "Original model already exists: $MODEL_ORIG"
+    fi
 
-        # 2. Set up Python venv
+    # 2. Set up Python venv (needed for patching/simplifying)
+    NEED_PYTHON=false
+    for res_entry in "${RESOLUTIONS[@]}"; do
+        tag="${res_entry#*:}"
+        if [ ! -f "$MODEL_DIR/rvm_${tag}.onnx" ]; then
+            NEED_PYTHON=true
+            break
+        fi
+    done
+
+    if [ "$NEED_PYTHON" = true ]; then
         if ! check_cmd uv; then
             info "Installing uv (Python package manager)"
-            # F15: Pin to specific version instead of latest
             curl -LsSf https://astral.sh/uv/0.6.2/install.sh | sh
             export PATH="$HOME/.local/bin:$PATH"
         fi
@@ -182,42 +190,90 @@ if [ "$SKIP_MODEL" = false ]; then
         uv pip install -q onnx==1.16.2 onnx-graphsurgeon==0.5.2 onnxsim onnxruntime
         ok "Python environment ready"
 
-        # 3. Patch: bake downsample_ratio as constant
-        info "Patching model (baking downsample_ratio=0.25)"
-        python scripts/patch_onnx.py "$MODEL_ORIG" "$MODEL_PATCHED"
-        ok "Patched: $MODEL_PATCHED"
+        # 3. Patch: bake downsample_ratio as constant (once)
+        if [ ! -f "$MODEL_PATCHED" ]; then
+            info "Patching model (baking downsample_ratio=0.25)"
+            python scripts/patch_onnx.py "$MODEL_ORIG" "$MODEL_PATCHED"
+            ok "Patched: $MODEL_PATCHED"
+        fi
 
-        # 4. Simplify: fold all shape nodes into static constants
-        info "Simplifying model (folding shapes to static)"
-        onnxsim "$MODEL_PATCHED" "$MODEL_SIMPLIFIED" \
-            --overwrite-input-shape \
-            src:1,3,1080,1920 \
-            r1i:1,16,135,240 \
-            r2i:1,20,68,120 \
-            r3i:1,40,34,60 \
-            r4i:1,64,17,30
-        ok "Simplified: $MODEL_SIMPLIFIED"
+        # 4. Simplify for each resolution
+        for res_entry in "${RESOLUTIONS[@]}"; do
+            dims="${res_entry%%:*}"
+            tag="${res_entry#*:}"
+            W="${dims%%x*}"
+            H="${dims#*x}"
+            ONNX_OUT="$MODEL_DIR/rvm_${tag}.onnx"
+
+            if [ -f "$ONNX_OUT" ]; then
+                ok "Simplified model already exists: $ONNX_OUT"
+                continue
+            fi
+
+            info "Simplifying model for ${tag} (${W}x${H})"
+
+            # Compute recurrent state spatial dimensions
+            # intH = H/4, intW = W/4, then divide by {2,4,8,16} with ceiling
+            intH=$((H / 4))
+            intW=$((W / 4))
+            r1h=$(( (intH + 1) / 2 ))  ; r1w=$(( (intW + 1) / 2 ))
+            r2h=$(( (intH + 3) / 4 ))  ; r2w=$(( (intW + 3) / 4 ))
+            r3h=$(( (intH + 7) / 8 ))  ; r3w=$(( (intW + 7) / 8 ))
+            r4h=$(( (intH + 15) / 16 )); r4w=$(( (intW + 15) / 16 ))
+
+            onnxsim "$MODEL_PATCHED" "$ONNX_OUT" \
+                --overwrite-input-shape \
+                "src:1,3,${H},${W}" \
+                "r1i:1,16,${r1h},${r1w}" \
+                "r2i:1,20,${r2h},${r2w}" \
+                "r3i:1,40,${r3h},${r3w}" \
+                "r4i:1,64,${r4h},${r4w}"
+            ok "Simplified: $ONNX_OUT"
+        done
 
         deactivate 2>/dev/null || true
     fi
 
-    # 5. Build TensorRT engine
-    if [ -f "$MODEL_DIR/rvm.plan" ]; then
-        ok "TensorRT engine already exists: $MODEL_DIR/rvm.plan"
-        warn "Delete it to force rebuild (engine is GPU- and TRT-version-specific)"
-    else
+    # Backward-compat symlink
+    if [ ! -e "$MODEL_DIR/rvm_mobilenetv3_fp32_simplified.onnx" ] && [ -f "$MODEL_DIR/rvm_1080p.onnx" ]; then
+        ln -sf rvm_1080p.onnx "$MODEL_DIR/rvm_mobilenetv3_fp32_simplified.onnx"
+        ok "Created backward-compat symlink: rvm_mobilenetv3_fp32_simplified.onnx → rvm_1080p.onnx"
+    fi
+
+    # 5. Build TensorRT engines for each resolution
+    for res_entry in "${RESOLUTIONS[@]}"; do
+        tag="${res_entry#*:}"
+        ONNX_IN="$MODEL_DIR/rvm_${tag}.onnx"
+        PLAN_OUT="$MODEL_DIR/rvm_${tag}.plan"
+
+        if [ ! -f "$ONNX_IN" ]; then
+            warn "ONNX model not found: $ONNX_IN — skipping TRT build"
+            continue
+        fi
+        if [ -f "$PLAN_OUT" ]; then
+            ok "TensorRT engine already exists: $PLAN_OUT"
+            warn "Delete it to force rebuild (engine is GPU- and TRT-version-specific)"
+            continue
+        fi
         if check_cmd trtexec; then
-            info "Building TensorRT engine (this takes 2-5 minutes)"
+            info "Building TensorRT engine for ${tag} (this takes 2-5 minutes)"
             trtexec \
-                --onnx="$MODEL_SIMPLIFIED" \
-                --saveEngine="$MODEL_DIR/rvm.plan" \
+                --onnx="$ONNX_IN" \
+                --saveEngine="$PLAN_OUT" \
                 --fp16 \
                 2>&1 | tail -5
-            ok "Engine built: $MODEL_DIR/rvm.plan"
+            ok "Engine built: $PLAN_OUT"
         else
             warn "trtexec not found — engine will be built on first run"
         fi
+    done
+
+    # Backward-compat symlink for plan
+    if [ ! -e "$MODEL_DIR/rvm.plan" ] && [ -f "$MODEL_DIR/rvm_1080p.plan" ]; then
+        ln -sf rvm_1080p.plan "$MODEL_DIR/rvm.plan"
+        ok "Created backward-compat symlink: rvm.plan → rvm_1080p.plan"
     fi
+
     echo ""
 fi
 
