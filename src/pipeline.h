@@ -17,6 +17,7 @@ struct PipelineConfig {
     bool fp16 = true;
     float downsampleRatio = 0.25f;
     uint8_t bgR = 0, bgG = 177, bgB = 64;  // green screen default
+    float alphaSmoothing = 1.0f;  // 1.0 = no smoothing, lower = more temporal smoothing
     bool benchmark = false;
 };
 
@@ -67,6 +68,8 @@ private:
     float*   d_src_ = nullptr;        // preprocessed RGB FP32 BCHW
     float*   d_fgr_ = nullptr;        // foreground output FP32
     float*   d_pha_ = nullptr;        // alpha output FP32
+    float*   d_phaPrev_ = nullptr;   // previous alpha for EMA smoothing
+    bool     firstFrame_ = true;
     uint8_t* d_outputYuyv_ = nullptr;
 
     // Recurrent states: ping-pong buffers [2 sets][4 states] (float32)

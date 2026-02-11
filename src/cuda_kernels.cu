@@ -68,6 +68,29 @@ void launchRgbToFp32(const uint8_t* d_rgb_u8, float* d_rgb_fp32,
 }
 
 // ---------------------------------------------------------------------------
+// Alpha EMA temporal smoothing
+// ---------------------------------------------------------------------------
+__global__ void alphaEmaKernel(float* __restrict__ pha,
+                                float* __restrict__ phaPrev,
+                                int width, int height, float factor) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    int idx = y * width + x;
+    float smoothed = phaPrev[idx] * (1.0f - factor) + pha[idx] * factor;
+    pha[idx] = smoothed;
+    phaPrev[idx] = smoothed;
+}
+
+void launchAlphaEma(float* d_pha, float* d_phaPrev,
+                    int width, int height, float factor, cudaStream_t stream) {
+    dim3 block(32, 8);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    alphaEmaKernel<<<grid, block, 0, stream>>>(d_pha, d_phaPrev, width, height, factor);
+}
+
+// ---------------------------------------------------------------------------
 // Composite FGR+PHA → YUYV (float32 inputs)
 // Processes 2 horizontal pixels per thread (YUYV macro-pixel).
 // ---------------------------------------------------------------------------

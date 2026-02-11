@@ -23,6 +23,7 @@ static void printUsage(const char* prog) {
         "  -d, --downsample RATIO    RVM downsample ratio (default: 0.25)\n"
         "  -b, --background MODE     green|color (default: green)\n"
         "  -c, --color R,G,B         Background color for 'color' mode\n"
+        "  -s, --smooth FACTOR       Alpha temporal smoothing (0.0-1.0, default: 1.0=off)\n"
         "      --no-fp16             Disable FP16 (use FP32)\n"
         "      --benchmark           Print per-frame timing stats\n"
         "  -h, --help                Show this help\n",
@@ -42,6 +43,7 @@ int main(int argc, char* argv[]) {
         {"downsample", required_argument, nullptr, 'd'},
         {"background", required_argument, nullptr, 'b'},
         {"color",      required_argument, nullptr, 'c'},
+        {"smooth",     required_argument, nullptr, 's'},
         {"no-fp16",    no_argument,       nullptr, 1},
         {"benchmark",  no_argument,       nullptr, 2},
         {"help",       no_argument,       nullptr, 'h'},
@@ -49,7 +51,7 @@ int main(int argc, char* argv[]) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:o:W:H:m:e:d:b:c:h", longOpts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:o:W:H:m:e:d:b:c:s:h", longOpts, nullptr)) != -1) {
         switch (opt) {
             case 'i': cfg.inputDevice = optarg; break;
             case 'o': cfg.outputDevice = optarg; break;
@@ -69,6 +71,7 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
                 break;
+            case 's': cfg.alphaSmoothing = atof(optarg); break;
             case 1: cfg.fp16 = false; break;
             case 2: cfg.benchmark = true; break;
             case 'h':
@@ -90,6 +93,11 @@ int main(int argc, char* argv[]) {
     if (cfg.downsampleRatio <= 0.0f || cfg.downsampleRatio > 1.0f) {
         fprintf(stderr, "Error: downsample ratio must be in (0.0, 1.0], got %f\n",
                 cfg.downsampleRatio);
+        return 1;
+    }
+    if (cfg.alphaSmoothing <= 0.0f || cfg.alphaSmoothing > 1.0f) {
+        fprintf(stderr, "Error: smooth factor must be in (0.0, 1.0], got %f\n",
+                cfg.alphaSmoothing);
         return 1;
     }
 
@@ -130,6 +138,8 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "  Model: %s\n", cfg.onnxPath.c_str());
     fprintf(stderr, "  FP16: %s\n", cfg.fp16 ? "yes" : "no");
     fprintf(stderr, "  Background: RGB(%d,%d,%d)\n", cfg.bgR, cfg.bgG, cfg.bgB);
+    if (cfg.alphaSmoothing < 1.0f)
+        fprintf(stderr, "  Alpha smoothing: %.2f\n", cfg.alphaSmoothing);
 
     Pipeline pipeline(cfg);
     if (!pipeline.init()) {

@@ -168,6 +168,9 @@ bool Pipeline::allocateGpuMemory() {
     CUDA_CHECK(cudaMalloc(&d_src_, srcBytes));
     CUDA_CHECK(cudaMalloc(&d_fgr_, fgrBytes));
     CUDA_CHECK(cudaMalloc(&d_pha_, phaBytes));
+    if (cfg_.alphaSmoothing < 1.0f) {
+        CUDA_CHECK(cudaMalloc(&d_phaPrev_, phaBytes));
+    }
     CUDA_CHECK(cudaMalloc(&d_outputYuyv_, yuyvBytes_));
 
     for (int s = 0; s < 2; s++) {
@@ -190,6 +193,7 @@ void Pipeline::freeGpuMemory() {
     if (d_src_) { cudaFree(d_src_); d_src_ = nullptr; }
     if (d_fgr_) { cudaFree(d_fgr_); d_fgr_ = nullptr; }
     if (d_pha_) { cudaFree(d_pha_); d_pha_ = nullptr; }
+    if (d_phaPrev_) { cudaFree(d_phaPrev_); d_phaPrev_ = nullptr; }
     if (d_outputYuyv_) { cudaFree(d_outputYuyv_); d_outputYuyv_ = nullptr; }
     for (int s = 0; s < 2; s++)
         for (int i = 0; i < 4; i++)
@@ -320,6 +324,21 @@ bool Pipeline::processFrame() {
         return false;
     }
     recIdx_ = next;
+
+    // 3b. Alpha temporal smoothing
+    if (cfg_.alphaSmoothing < 1.0f) {
+        if (firstFrame_) {
+            // Seed phaPrev with the first frame's alpha
+            CUDA_CHECK(cudaMemcpyAsync(d_phaPrev_, d_pha_,
+                static_cast<size_t>(cfg_.width) * cfg_.height * sizeof(float),
+                cudaMemcpyDeviceToDevice, stream_));
+            firstFrame_ = false;
+        } else {
+            launchAlphaEma(d_pha_, d_phaPrev_, cfg_.width, cfg_.height,
+                           cfg_.alphaSmoothing, stream_);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
 
     // 4. Composite + color convert
     launchCompositeToYuyv(d_fgr_, d_pha_, d_outputYuyv_,
