@@ -223,6 +223,12 @@ bool Pipeline::allocateGpuMemory() {
         }
     }
 
+    // Guided filter scratch buffers (operates at 1/4 resolution)
+    if (cfg_.refineAlpha) {
+        guidedFilterInit(gfState_, W, H, 4);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     fprintf(stderr, "GPU memory allocated (double-buffered, float32 I/O)\n");
     return true;
 }
@@ -242,6 +248,7 @@ void Pipeline::freeGpuMemory() {
     for (int s = 0; s < 2; s++)
         for (int i = 0; i < 4; i++)
             if (d_rec_[s][i]) { cudaFree(d_rec_[s][i]); d_rec_[s][i] = nullptr; }
+    guidedFilterFree(gfState_);
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +459,14 @@ bool Pipeline::processFrame() {
         }
     }
 
-    // 3d. Despill: suppress background color contamination at edges
+    // 3d. Guided filter: refine alpha using high-res RGB as guide
+    if (cfg_.refineAlpha) {
+        launchGuidedFilterAlpha(gfState_, slots_[consumedSlot].d_input, d_pha_,
+                                 cfg_.gfRadius, cfg_.gfEps, stream_);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // 3e. Despill: suppress background color contamination at edges
     if (cfg_.despillStrength > 0.0f) {
         launchDespill(d_fgr_, d_pha_, cfg_.width, cfg_.height,
                       cfg_.bgR / 255.0f, cfg_.bgG / 255.0f, cfg_.bgB / 255.0f,

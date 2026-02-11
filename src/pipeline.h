@@ -2,6 +2,7 @@
 #include "v4l2_capture.h"
 #include "v4l2_output.h"
 #include "trt_engine.h"
+#include "cuda_kernels.h"
 #include <cuda_runtime.h>
 #include <nvjpeg.h>
 #include <atomic>
@@ -23,6 +24,9 @@ struct PipelineConfig {
     uint8_t bgR = 0, bgG = 177, bgB = 64;  // green screen default
     float alphaSmoothing = 1.0f;  // 1.0 = no smoothing
     float despillStrength = 0.8f; // 0.0 = off, 1.0 = full suppression
+    bool refineAlpha = true;     // guided filter alpha refinement
+    int gfRadius = 3;            // guided filter radius (at low-res)
+    float gfEps = 0.02f;         // guided filter regularization
     int resetInterval = 300;     // zero recurrent states every N frames (0 = disable)
     bool benchmark = false;
 };
@@ -105,6 +109,8 @@ private:
 
     struct RecDim { int ch; int h; int w; size_t bytes; };
     RecDim recDims_[4] = {};
+
+    GuidedFilterState gfState_;
 
     size_t rgbBytes_ = 0;
     size_t yuyvBytes_ = 0;
