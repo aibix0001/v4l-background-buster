@@ -27,15 +27,25 @@ Pipeline::Pipeline(const PipelineConfig& cfg)
       capture_(cfg.inputDevice, cfg.width, cfg.height) {}
 
 Pipeline::~Pipeline() {
+    // Stop capture thread
+    stopCapture_ = true;
+    cvConsumed_.notify_all();
+    cvReady_.notify_all();
+    if (captureThread_.joinable())
+        captureThread_.join();
+
     freeGpuMemory();
     if (stream_) cudaStreamDestroy(stream_);
     if (evStart_) cudaEventDestroy(evStart_);
     if (evStop_) cudaEventDestroy(evStop_);
+    for (int s = 0; s < NUM_SLOTS; s++) {
+        if (slotDoneEvent_[s]) cudaEventDestroy(slotDoneEvent_[s]);
+        if (slots_[s].nvState) nvjpegJpegStateDestroy(slots_[s].nvState);
+        if (slots_[s].nvStream) nvjpegJpegStreamDestroy(slots_[s].nvStream);
+        if (slots_[s].nvDeviceBuf) nvjpegBufferDeviceDestroy(slots_[s].nvDeviceBuf);
+        if (slots_[s].nvPinnedBuf) nvjpegBufferPinnedDestroy(slots_[s].nvPinnedBuf);
+    }
     if (nvjpegParams_) nvjpegDecodeParamsDestroy(nvjpegParams_);
-    if (nvjpegStream_) nvjpegJpegStreamDestroy(nvjpegStream_);
-    if (nvjpegDeviceBuf_) nvjpegBufferDeviceDestroy(nvjpegDeviceBuf_);
-    if (nvjpegPinnedBuf_) nvjpegBufferPinnedDestroy(nvjpegPinnedBuf_);
-    if (nvjpegState_) nvjpegJpegStateDestroy(nvjpegState_);
     if (nvjpegDecoder_) nvjpegDecoderDestroy(nvjpegDecoder_);
     if (nvjpegHandle_) nvjpegDestroy(nvjpegHandle_);
 }
@@ -56,7 +66,7 @@ bool Pipeline::init() {
     fprintf(stderr, "Using resolution: %dx%d\n", cfg_.width, cfg_.height);
 
     if (captureFmt_ == V4L2_PIX_FMT_MJPEG) {
-        // Init nvJPEG decoupled decoder (GPU-hybrid: CPU Huffman + GPU IDCT)
+        // Init shared nvJPEG handles
         nvjpegStatus_t st;
         st = nvjpegCreateEx(NVJPEG_BACKEND_GPU_HYBRID, nullptr, nullptr, 0, &nvjpegHandle_);
         if (st != NVJPEG_STATUS_SUCCESS) {
@@ -68,43 +78,48 @@ bool Pipeline::init() {
             fprintf(stderr, "nvjpegDecoderCreate failed: %d\n", st);
             return false;
         }
-        st = nvjpegDecoderStateCreate(nvjpegHandle_, nvjpegDecoder_, &nvjpegState_);
-        if (st != NVJPEG_STATUS_SUCCESS) {
-            fprintf(stderr, "nvjpegDecoderStateCreate failed: %d\n", st);
-            return false;
-        }
-        st = nvjpegBufferPinnedCreate(nvjpegHandle_, nullptr, &nvjpegPinnedBuf_);
-        if (st != NVJPEG_STATUS_SUCCESS) {
-            fprintf(stderr, "nvjpegBufferPinnedCreate failed: %d\n", st);
-            return false;
-        }
-        st = nvjpegBufferDeviceCreate(nvjpegHandle_, nullptr, &nvjpegDeviceBuf_);
-        if (st != NVJPEG_STATUS_SUCCESS) {
-            fprintf(stderr, "nvjpegBufferDeviceCreate failed: %d\n", st);
-            return false;
-        }
-        st = nvjpegStateAttachPinnedBuffer(nvjpegState_, nvjpegPinnedBuf_);
-        if (st != NVJPEG_STATUS_SUCCESS) {
-            fprintf(stderr, "nvjpegStateAttachPinnedBuffer failed: %d\n", st);
-            return false;
-        }
-        st = nvjpegStateAttachDeviceBuffer(nvjpegState_, nvjpegDeviceBuf_);
-        if (st != NVJPEG_STATUS_SUCCESS) {
-            fprintf(stderr, "nvjpegStateAttachDeviceBuffer failed: %d\n", st);
-            return false;
-        }
-        st = nvjpegJpegStreamCreate(nvjpegHandle_, &nvjpegStream_);
-        if (st != NVJPEG_STATUS_SUCCESS) {
-            fprintf(stderr, "nvjpegJpegStreamCreate failed: %d\n", st);
-            return false;
-        }
         st = nvjpegDecodeParamsCreate(nvjpegHandle_, &nvjpegParams_);
         if (st != NVJPEG_STATUS_SUCCESS) {
             fprintf(stderr, "nvjpegDecodeParamsCreate failed: %d\n", st);
             return false;
         }
         nvjpegDecodeParamsSetOutputFormat(nvjpegParams_, NVJPEG_OUTPUT_RGBI);
-        fprintf(stderr, "MJPEG capture — using nvJPEG GPU-hybrid decoder\n");
+
+        // Per-slot nvJPEG state
+        for (int s = 0; s < NUM_SLOTS; s++) {
+            auto& slot = slots_[s];
+            st = nvjpegDecoderStateCreate(nvjpegHandle_, nvjpegDecoder_, &slot.nvState);
+            if (st != NVJPEG_STATUS_SUCCESS) {
+                fprintf(stderr, "nvjpegDecoderStateCreate[%d] failed: %d\n", s, st);
+                return false;
+            }
+            st = nvjpegBufferPinnedCreate(nvjpegHandle_, nullptr, &slot.nvPinnedBuf);
+            if (st != NVJPEG_STATUS_SUCCESS) {
+                fprintf(stderr, "nvjpegBufferPinnedCreate[%d] failed: %d\n", s, st);
+                return false;
+            }
+            st = nvjpegBufferDeviceCreate(nvjpegHandle_, nullptr, &slot.nvDeviceBuf);
+            if (st != NVJPEG_STATUS_SUCCESS) {
+                fprintf(stderr, "nvjpegBufferDeviceCreate[%d] failed: %d\n", s, st);
+                return false;
+            }
+            st = nvjpegStateAttachPinnedBuffer(slot.nvState, slot.nvPinnedBuf);
+            if (st != NVJPEG_STATUS_SUCCESS) {
+                fprintf(stderr, "nvjpegStateAttachPinnedBuffer[%d] failed: %d\n", s, st);
+                return false;
+            }
+            st = nvjpegStateAttachDeviceBuffer(slot.nvState, slot.nvDeviceBuf);
+            if (st != NVJPEG_STATUS_SUCCESS) {
+                fprintf(stderr, "nvjpegStateAttachDeviceBuffer[%d] failed: %d\n", s, st);
+                return false;
+            }
+            st = nvjpegJpegStreamCreate(nvjpegHandle_, &slot.nvStream);
+            if (st != NVJPEG_STATUS_SUCCESS) {
+                fprintf(stderr, "nvjpegJpegStreamCreate[%d] failed: %d\n", s, st);
+                return false;
+            }
+        }
+        fprintf(stderr, "MJPEG capture — using nvJPEG GPU-hybrid decoder (double-buffered)\n");
     }
 
     // Auto-resolve model paths based on negotiated resolution
@@ -132,11 +147,19 @@ bool Pipeline::init() {
         CUDA_CHECK(cudaEventCreate(&evStart_));
         CUDA_CHECK(cudaEventCreate(&evStop_));
     }
+    // Create slot-done events and seed them so first cudaEventSynchronize returns immediately
+    for (int s = 0; s < NUM_SLOTS; s++) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&slotDoneEvent_[s], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(slotDoneEvent_[s], stream_));
+    }
 
     if (!allocateGpuMemory()) return false;
     if (!capture_.startStreaming()) return false;
 
-    fprintf(stderr, "Pipeline initialized successfully\n");
+    // Start capture thread
+    captureThread_ = std::thread(&Pipeline::captureThreadFunc, this);
+
+    fprintf(stderr, "Pipeline initialized successfully (double-buffered)\n");
     return true;
 }
 
@@ -144,7 +167,6 @@ bool Pipeline::allocateGpuMemory() {
     int W = cfg_.width;
     int H = cfg_.height;
 
-    // F2: Validate dimensions and use size_t arithmetic to prevent overflow
     if (W < 1 || W > 8192 || H < 1 || H > 8192) {
         fprintf(stderr, "Invalid dimensions %dx%d (must be 1..8192)\n", W, H);
         return false;
@@ -153,11 +175,12 @@ bool Pipeline::allocateGpuMemory() {
 
     rgbBytes_ = pixels * 3;
     yuyvBytes_ = pixels * 2;
-    size_t srcBytes = pixels * 3 * sizeof(float);  // RGB FP32 BCHW
+    stagingSize_ = (rgbBytes_ > yuyvBytes_) ? rgbBytes_ : yuyvBytes_;
+    size_t srcBytes = pixels * 3 * sizeof(float);
     size_t fgrBytes = pixels * 3 * sizeof(float);
     size_t phaBytes = pixels * 1 * sizeof(float);
 
-    // Recurrent state dimensions (from simplified model's static shapes)
+    // Recurrent state dimensions
     int intH = H / 4;
     int intW = W / 4;
     int divs[] = {2, 4, 8, 16};
@@ -169,23 +192,23 @@ bool Pipeline::allocateGpuMemory() {
         recDims_[i].bytes = 1 * chs[i] * recDims_[i].h * recDims_[i].w * sizeof(float);
     }
 
-    CUDA_CHECK(cudaHostAlloc(&h_rgb_, rgbBytes_, cudaHostAllocDefault));
-    CUDA_CHECK(cudaHostAlloc(&h_output_, yuyvBytes_, cudaHostAllocDefault));
-
-    // #14: Only allocate the input buffer needed for the negotiated format
-    if (captureFmt_ == V4L2_PIX_FMT_MJPEG) {
-        CUDA_CHECK(cudaMalloc(&d_inputRgb_, rgbBytes_));
-        // Pinned staging for compressed JPEG data
-        jpegStagingSize_ = yuyvBytes_;  // MJPEG compressed is always smaller than raw YUYV
-        CUDA_CHECK(cudaHostAlloc(&h_jpegStaging_, jpegStagingSize_, cudaHostAllocDefault));
-        // Set up nvJPEG output descriptor to point to d_inputRgb_
-        memset(&nvjpegOutput_, 0, sizeof(nvjpegOutput_));
-        nvjpegOutput_.channel[0] = d_inputRgb_;
-        nvjpegOutput_.pitch[0] = W * 3;  // interleaved RGB, pitch = width * 3
-    } else {
-        CUDA_CHECK(cudaMalloc(&d_inputYuyv_, yuyvBytes_));
+    // Per-slot allocations (double-buffered inputs)
+    for (int s = 0; s < NUM_SLOTS; s++) {
+        auto& slot = slots_[s];
+        CUDA_CHECK(cudaHostAlloc(&slot.h_staging, stagingSize_, cudaHostAllocDefault));
+        if (captureFmt_ == V4L2_PIX_FMT_MJPEG) {
+            CUDA_CHECK(cudaMalloc(&slot.d_input, rgbBytes_));
+            memset(&slot.nvOutput, 0, sizeof(slot.nvOutput));
+            slot.nvOutput.channel[0] = slot.d_input;
+            slot.nvOutput.pitch[0] = W * 3;  // interleaved RGB
+        } else {
+            CUDA_CHECK(cudaMalloc(&slot.d_input, yuyvBytes_));
+        }
+        CUDA_CHECK(cudaMalloc(&slot.d_src, srcBytes));
     }
-    CUDA_CHECK(cudaMalloc(&d_src_, srcBytes));
+
+    // Single-buffered allocations (outputs, consumed before next frame)
+    CUDA_CHECK(cudaHostAlloc(&h_output_, yuyvBytes_, cudaHostAllocDefault));
     CUDA_CHECK(cudaMalloc(&d_fgr_, fgrBytes));
     CUDA_CHECK(cudaMalloc(&d_pha_, phaBytes));
     if (cfg_.alphaSmoothing < 1.0f) {
@@ -200,17 +223,18 @@ bool Pipeline::allocateGpuMemory() {
         }
     }
 
-    fprintf(stderr, "GPU memory allocated (float32 I/O)\n");
+    fprintf(stderr, "GPU memory allocated (double-buffered, float32 I/O)\n");
     return true;
 }
 
 void Pipeline::freeGpuMemory() {
-    if (h_rgb_) { cudaFreeHost(h_rgb_); h_rgb_ = nullptr; }
+    for (int s = 0; s < NUM_SLOTS; s++) {
+        auto& slot = slots_[s];
+        if (slot.h_staging) { cudaFreeHost(slot.h_staging); slot.h_staging = nullptr; }
+        if (slot.d_input) { cudaFree(slot.d_input); slot.d_input = nullptr; }
+        if (slot.d_src) { cudaFree(slot.d_src); slot.d_src = nullptr; }
+    }
     if (h_output_) { cudaFreeHost(h_output_); h_output_ = nullptr; }
-    if (h_jpegStaging_) { cudaFreeHost(h_jpegStaging_); h_jpegStaging_ = nullptr; }
-    if (d_inputRgb_) { cudaFree(d_inputRgb_); d_inputRgb_ = nullptr; }
-    if (d_inputYuyv_) { cudaFree(d_inputYuyv_); d_inputYuyv_ = nullptr; }
-    if (d_src_) { cudaFree(d_src_); d_src_ = nullptr; }
     if (d_fgr_) { cudaFree(d_fgr_); d_fgr_ = nullptr; }
     if (d_pha_) { cudaFree(d_pha_); d_pha_ = nullptr; }
     if (d_phaPrev_) { cudaFree(d_phaPrev_); d_phaPrev_ = nullptr; }
@@ -220,6 +244,107 @@ void Pipeline::freeGpuMemory() {
             if (d_rec_[s][i]) { cudaFree(d_rec_[s][i]); d_rec_[s][i] = nullptr; }
 }
 
+// ---------------------------------------------------------------------------
+// Capture thread: V4L2 DQBUF + memcpy + CPU Huffman decode (MJPEG)
+// Runs concurrently with GPU processing on the main thread.
+// ---------------------------------------------------------------------------
+void Pipeline::captureThreadFunc() {
+    int slot = 0;
+
+    while (!stopCapture_) {
+        auto& s = slots_[slot];
+
+        // Wait until this slot has been consumed by the main thread
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            cvConsumed_.wait(lock, [&] { return !s.ready || stopCapture_.load(); });
+            if (stopCapture_) break;
+        }
+
+        // Wait for GPU to finish with this slot's device buffers
+        cudaEventSynchronize(slotDoneEvent_[slot]);
+
+        // V4L2 capture (blocking, with poll timeout)
+        size_t frameSize = 0;
+        const uint8_t* mmapPtr = capture_.dequeueLatestFrame(frameSize);
+        if (!mmapPtr) {
+            std::lock_guard<std::mutex> lock(mtx_);
+            captureError_ = true;
+            s.ready = true;
+            s.valid = false;
+            cvReady_.notify_one();
+            break;
+        }
+
+        // Copy frame data to pinned staging, requeue mmap buffer
+        if (frameSize > stagingSize_) {
+            capture_.requeueBuffer();
+            std::lock_guard<std::mutex> lock(mtx_);
+            s.ready = true;
+            s.valid = false;
+            cvReady_.notify_one();
+            slot = 1 - slot;
+            continue;
+        }
+        memcpy(s.h_staging, mmapPtr, frameSize);
+        capture_.requeueBuffer();
+        s.frameSize = frameSize;
+
+        // CPU-phase decode (MJPEG only — this overlaps with GPU work)
+        if (captureFmt_ == V4L2_PIX_FMT_MJPEG) {
+            // Parse JPEG header
+            nvjpegStatus_t st = nvjpegJpegStreamParse(nvjpegHandle_,
+                s.h_staging, frameSize, 0, 0, s.nvStream);
+            if (st != NVJPEG_STATUS_SUCCESS) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                s.ready = true;
+                s.valid = false;
+                cvReady_.notify_one();
+                slot = 1 - slot;
+                continue;
+            }
+
+            // Validate dimensions
+            unsigned int jpegW, jpegH;
+            nvjpegJpegStreamGetFrameDimensions(s.nvStream, &jpegW, &jpegH);
+            if (static_cast<int>(jpegW) != cfg_.width ||
+                static_cast<int>(jpegH) != cfg_.height) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                s.ready = true;
+                s.valid = false;
+                cvReady_.notify_one();
+                slot = 1 - slot;
+                continue;
+            }
+
+            // CPU Huffman decode (the main overlap win)
+            st = nvjpegDecodeJpegHost(nvjpegHandle_, nvjpegDecoder_, s.nvState,
+                                       nvjpegParams_, s.nvStream);
+            if (st != NVJPEG_STATUS_SUCCESS) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                s.ready = true;
+                s.valid = false;
+                cvReady_.notify_one();
+                slot = 1 - slot;
+                continue;
+            }
+        }
+
+        // Signal slot ready
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            s.ready = true;
+            s.valid = true;
+            cvReady_.notify_one();
+        }
+
+        slot = 1 - slot;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main-thread frame processing
+// ---------------------------------------------------------------------------
 bool Pipeline::processFrame() {
     struct timespec wallStart{}, wallEnd{};
     if (cfg_.benchmark) {
@@ -227,107 +352,68 @@ bool Pipeline::processFrame() {
         clock_gettime(CLOCK_MONOTONIC, &wallStart);
     }
 
-    // 1. Capture (#6: drain stale frames, keep latest)
-    size_t frameSize = 0;
-    const uint8_t* mmapPtr = capture_.dequeueLatestFrame(frameSize);
-    if (!mmapPtr) return false;
+    // 1. Wait for capture thread to fill current slot
+    auto& slot = slots_[processSlotIdx_];
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        cvReady_.wait(lock, [&] { return slot.ready || captureError_; });
+        if (captureError_) return false;
+    }
 
-    // 2. Decode and upload
+    if (!slot.valid) {
+        // Skip invalid frame, release slot for capture thread
+        slot.ready = false;
+        cvConsumed_.notify_one();
+        processSlotIdx_ = 1 - processSlotIdx_;
+        if (++consecutiveSkips_ > 30) {
+            fprintf(stderr, "Too many consecutive skipped frames (%d), aborting\n", consecutiveSkips_);
+            return false;
+        }
+        return true;
+    }
+
+    // 2. GPU-phase decode and preprocess
     if (captureFmt_ == V4L2_PIX_FMT_MJPEG) {
-        // Copy compressed JPEG to pinned staging buffer, requeue mmap early
-        if (frameSize > jpegStagingSize_) {
-            fprintf(stderr, "MJPEG frame too large: %zu > %zu — skipping\n", frameSize, jpegStagingSize_);
-            capture_.requeueBuffer();
-            if (++consecutiveSkips_ > 30) {
-                fprintf(stderr, "Too many consecutive skipped frames (%d), aborting\n", consecutiveSkips_);
-                return false;
-            }
-            return true;
-        }
-        memcpy(h_jpegStaging_, mmapPtr, frameSize);
-        capture_.requeueBuffer();
-
-        // nvJPEG decoupled 3-phase decode
-        // Phase 1: Parse JPEG header
-        nvjpegStatus_t st = nvjpegJpegStreamParse(nvjpegHandle_,
-            h_jpegStaging_, frameSize, 0, 0, nvjpegStream_);
-        if (st != NVJPEG_STATUS_SUCCESS) {
-            if (++consecutiveSkips_ > 30) {
-                fprintf(stderr, "Too many consecutive corrupt frames (%d), aborting\n", consecutiveSkips_);
-                return false;
-            }
-            return true;  // corrupt JPEG, skip
-        }
-
-        // Validate dimensions
-        unsigned int jpegW, jpegH;
-        nvjpegJpegStreamGetFrameDimensions(nvjpegStream_, &jpegW, &jpegH);
-        if (static_cast<int>(jpegW) != cfg_.width || static_cast<int>(jpegH) != cfg_.height) {
-            fprintf(stderr, "JPEG frame size mismatch: got %ux%u, expected %dx%d — skipping\n",
-                    jpegW, jpegH, cfg_.width, cfg_.height);
-            if (++consecutiveSkips_ > 30) {
-                fprintf(stderr, "Too many consecutive skipped frames (%d), aborting\n", consecutiveSkips_);
-                return false;
-            }
-            return true;
-        }
-
-        // Phase 2: CPU Huffman decode
-        st = nvjpegDecodeJpegHost(nvjpegHandle_, nvjpegDecoder_, nvjpegState_,
-                                   nvjpegParams_, nvjpegStream_);
-        if (st != NVJPEG_STATUS_SUCCESS) {
-            if (++consecutiveSkips_ > 30) {
-                fprintf(stderr, "Too many consecutive corrupt frames (%d), aborting\n", consecutiveSkips_);
-                return false;
-            }
-            return true;  // bad JPEG, skip
-        }
-
-        // Phase 3: Transfer to GPU + GPU IDCT → d_inputRgb_ (interleaved RGB)
-        st = nvjpegDecodeJpegTransferToDevice(nvjpegHandle_, nvjpegDecoder_,
-                                               nvjpegState_, nvjpegStream_, stream_);
+        // Transfer coefficients to GPU + GPU IDCT → slot.d_input (interleaved RGB)
+        nvjpegStatus_t st = nvjpegDecodeJpegTransferToDevice(nvjpegHandle_, nvjpegDecoder_,
+                                                              slot.nvState, slot.nvStream, stream_);
         if (st != NVJPEG_STATUS_SUCCESS) {
             fprintf(stderr, "nvjpegDecodeJpegTransferToDevice failed: %d\n", st);
             return false;
         }
-        st = nvjpegDecodeJpegDevice(nvjpegHandle_, nvjpegDecoder_, nvjpegState_,
-                                     &nvjpegOutput_, stream_);
+        st = nvjpegDecodeJpegDevice(nvjpegHandle_, nvjpegDecoder_, slot.nvState,
+                                     &slot.nvOutput, stream_);
         if (st != NVJPEG_STATUS_SUCCESS) {
             fprintf(stderr, "nvjpegDecodeJpegDevice failed: %d\n", st);
             return false;
         }
-
-        // Convert interleaved RGB u8 → planar FP32 BCHW
-        launchRgbToFp32(d_inputRgb_, d_src_, cfg_.width, cfg_.height, stream_);
+        launchRgbToFp32(slot.d_input, slot.d_src, cfg_.width, cfg_.height, stream_);
         CUDA_CHECK(cudaGetLastError());
     } else {
-        // F4: Validate frame size before memcpy
-        if (frameSize > yuyvBytes_) {
-            fprintf(stderr, "YUYV frame too large: %zu > %zu — skipping\n", frameSize, yuyvBytes_);
-            capture_.requeueBuffer();
-            if (++consecutiveSkips_ > 30) {
-                fprintf(stderr, "Too many consecutive skipped frames (%d), aborting\n", consecutiveSkips_);
-                return false;
-            }
-            return true;
-        }
-        memcpy(h_rgb_, mmapPtr, frameSize);
-        capture_.requeueBuffer();
-
-        CUDA_CHECK(cudaMemcpyAsync(d_inputYuyv_, h_rgb_, yuyvBytes_,
+        // YUYV: H2D transfer + preprocess kernel
+        CUDA_CHECK(cudaMemcpyAsync(slot.d_input, slot.h_staging, yuyvBytes_,
                                    cudaMemcpyHostToDevice, stream_));
-        launchYuyvToRgbFp32(d_inputYuyv_, d_src_, cfg_.width, cfg_.height, stream_);
-        CUDA_CHECK(cudaGetLastError());  // F9: check kernel launch
+        launchYuyvToRgbFp32(slot.d_input, slot.d_src, cfg_.width, cfg_.height, stream_);
+        CUDA_CHECK(cudaGetLastError());
     }
 
-    // Successfully decoded a frame — reset skip counter
+    // Record event: GPU queued all reads from this slot's input buffers
+    CUDA_CHECK(cudaEventRecord(slotDoneEvent_[processSlotIdx_], stream_));
+
+    // Release slot for capture thread (it can start refilling while GPU runs)
+    int consumedSlot = processSlotIdx_;
+    slot.ready = false;
+    cvConsumed_.notify_one();
+    processSlotIdx_ = 1 - processSlotIdx_;
+
+    // Reset skip counter
     consecutiveSkips_ = 0;
 
-    // 3. TensorRT inference
+    // 3. TensorRT inference (reads slot.d_src, which is in-flight on stream)
     auto* ctx = engine_.context();
     int next = 1 - recIdx_;
 
-    ctx->setTensorAddress("src", d_src_);
+    ctx->setTensorAddress("src", slots_[consumedSlot].d_src);
     ctx->setTensorAddress("r1i", d_rec_[recIdx_][0]);
     ctx->setTensorAddress("r2i", d_rec_[recIdx_][1]);
     ctx->setTensorAddress("r3i", d_rec_[recIdx_][2]);
@@ -348,7 +434,6 @@ bool Pipeline::processFrame() {
     // 3b. Alpha temporal smoothing
     if (cfg_.alphaSmoothing < 1.0f) {
         if (firstFrame_) {
-            // Seed phaPrev with the first frame's alpha
             CUDA_CHECK(cudaMemcpyAsync(d_phaPrev_, d_pha_,
                 static_cast<size_t>(cfg_.width) * cfg_.height * sizeof(float),
                 cudaMemcpyDeviceToDevice, stream_));
@@ -364,14 +449,12 @@ bool Pipeline::processFrame() {
     launchCompositeToYuyv(d_fgr_, d_pha_, d_outputYuyv_,
                           cfg_.width, cfg_.height,
                           cfg_.bgR, cfg_.bgG, cfg_.bgB, stream_);
-    CUDA_CHECK(cudaGetLastError());  // F9: check kernel launch
+    CUDA_CHECK(cudaGetLastError());
 
     // 5. Download and write
     CUDA_CHECK(cudaMemcpyAsync(h_output_, d_outputYuyv_, yuyvBytes_,
                                cudaMemcpyDeviceToHost, stream_));
 
-    // F18: Record stop event before sync so timing measures GPU pipeline only,
-    // not the write() syscall or CPU sync overhead
     if (cfg_.benchmark)
         cudaEventRecord(evStop_, stream_);
 

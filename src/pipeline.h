@@ -4,8 +4,12 @@
 #include "trt_engine.h"
 #include <cuda_runtime.h>
 #include <nvjpeg.h>
+#include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 
 struct PipelineConfig {
     std::string inputDevice = "/dev/video0";
@@ -17,7 +21,7 @@ struct PipelineConfig {
     bool fp16 = true;
     float downsampleRatio = 0.25f;
     uint8_t bgR = 0, bgG = 177, bgB = 64;  // green screen default
-    float alphaSmoothing = 1.0f;  // 1.0 = no smoothing, lower = more temporal smoothing
+    float alphaSmoothing = 1.0f;  // 1.0 = no smoothing
     bool benchmark = false;
 };
 
@@ -36,6 +40,26 @@ public:
     float lastWallMs() const { return lastWallMs_; }
 
 private:
+    static constexpr int NUM_SLOTS = 2;
+
+    // Double-buffered input slot for CPU-GPU overlap
+    struct FrameSlot {
+        uint8_t* h_staging = nullptr;  // pinned host staging (JPEG or YUYV data)
+        uint8_t* d_input = nullptr;    // device: decoded RGB (MJPEG) or raw YUYV
+        float*   d_src = nullptr;      // device: preprocessed FP32 BCHW [1,3,H,W]
+
+        // Per-slot nvJPEG decode state (MJPEG only)
+        nvjpegJpegState_t nvState = nullptr;
+        nvjpegJpegStream_t nvStream = nullptr;
+        nvjpegBufferPinned_t nvPinnedBuf = nullptr;
+        nvjpegBufferDevice_t nvDeviceBuf = nullptr;
+        nvjpegImage_t nvOutput = {};
+
+        size_t frameSize = 0;
+        bool ready = false;
+        bool valid = false;
+    };
+
     PipelineConfig cfg_;
     V4L2Capture capture_;
     std::unique_ptr<V4L2Output> output_;
@@ -44,31 +68,31 @@ private:
     cudaStream_t stream_ = nullptr;
     uint32_t captureFmt_ = 0;
 
-    // nvJPEG decoupled decoder
+    // Shared nvJPEG handles (not per-slot)
     nvjpegHandle_t nvjpegHandle_ = nullptr;
-    nvjpegJpegState_t nvjpegState_ = nullptr;
     nvjpegJpegDecoder_t nvjpegDecoder_ = nullptr;
-    nvjpegJpegStream_t nvjpegStream_ = nullptr;
     nvjpegDecodeParams_t nvjpegParams_ = nullptr;
-    nvjpegBufferPinned_t nvjpegPinnedBuf_ = nullptr;
-    nvjpegBufferDevice_t nvjpegDeviceBuf_ = nullptr;
-    nvjpegImage_t nvjpegOutput_ = {};
 
-    // Pinned staging buffer for JPEG compressed data
-    uint8_t* h_jpegStaging_ = nullptr;
-    size_t jpegStagingSize_ = 0;
+    // Double-buffered input slots
+    FrameSlot slots_[NUM_SLOTS];
+    cudaEvent_t slotDoneEvent_[NUM_SLOTS] = {};
+    int processSlotIdx_ = 0;
 
-    // Pinned host memory
-    uint8_t* h_rgb_ = nullptr;
+    // Capture thread and synchronization
+    std::thread captureThread_;
+    std::mutex mtx_;
+    std::condition_variable cvReady_;
+    std::condition_variable cvConsumed_;
+    std::atomic<bool> stopCapture_{false};
+    bool captureError_ = false;  // accessed under mtx_
+
+    // Pinned host output (single-buffered, consumed before next frame)
     uint8_t* h_output_ = nullptr;
 
-    // Device memory (TRT I/O is float32 even with FP16 internal compute)
-    uint8_t* d_inputRgb_ = nullptr;
-    uint8_t* d_inputYuyv_ = nullptr;
-    float*   d_src_ = nullptr;        // preprocessed RGB FP32 BCHW
-    float*   d_fgr_ = nullptr;        // foreground output FP32
-    float*   d_pha_ = nullptr;        // alpha output FP32
-    float*   d_phaPrev_ = nullptr;   // previous alpha for EMA smoothing
+    // Device memory: TRT outputs and final YUYV (single-buffered)
+    float*   d_fgr_ = nullptr;
+    float*   d_pha_ = nullptr;
+    float*   d_phaPrev_ = nullptr;
     bool     firstFrame_ = true;
     uint8_t* d_outputYuyv_ = nullptr;
 
@@ -81,8 +105,9 @@ private:
 
     size_t rgbBytes_ = 0;
     size_t yuyvBytes_ = 0;
+    size_t stagingSize_ = 0;
 
-    int consecutiveSkips_ = 0;  // #10: track consecutive corrupt frames
+    int consecutiveSkips_ = 0;
 
     float lastFrameMs_ = 0.0f;
     float lastWallMs_ = 0.0f;
@@ -90,4 +115,5 @@ private:
 
     bool allocateGpuMemory();
     void freeGpuMemory();
+    void captureThreadFunc();
 };
