@@ -41,6 +41,11 @@ Pipeline::~Pipeline() {
     if (captureThread_.joinable())
         captureThread_.join();
 
+    for (int i = 0; i < NUM_SLOTS; i++) {
+        if (gfGraphExec_[i]) cudaGraphExecDestroy(gfGraphExec_[i]);
+        if (gfGraph_[i]) cudaGraphDestroy(gfGraph_[i]);
+    }
+
     freeGpuMemory();
     if (stream_) cudaStreamDestroy(stream_);
     if (evStart_) cudaEventDestroy(evStart_);
@@ -495,8 +500,23 @@ bool Pipeline::processFrame() {
 
     // 3d. Guided filter: refine alpha using high-res RGB as guide
     if (cfg_.refineAlpha) {
-        launchGuidedFilterAlpha(gfState_, slots_[consumedSlot].d_input, d_pha_,
-                                 cfg_.gfRadius, cfg_.gfEps, cfg_.perfLevel, stream_);
+        if (cfg_.perfLevel >= 3 && gfGraphCaptured_[consumedSlot]) {
+            // Replay captured CUDA graph (minimal launch overhead)
+            CUDA_CHECK(cudaGraphLaunch(gfGraphExec_[consumedSlot], stream_));
+        } else if (cfg_.perfLevel >= 3 && !gfGraphCaptured_[consumedSlot]) {
+            // Capture guided filter kernel sequence into a CUDA graph
+            CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
+            launchGuidedFilterAlpha(gfState_, slots_[consumedSlot].d_input, d_pha_,
+                                     cfg_.gfRadius, cfg_.gfEps, cfg_.perfLevel, stream_);
+            CUDA_CHECK(cudaStreamEndCapture(stream_, &gfGraph_[consumedSlot]));
+            CUDA_CHECK(cudaGraphInstantiate(&gfGraphExec_[consumedSlot],
+                                             gfGraph_[consumedSlot], 0));
+            CUDA_CHECK(cudaGraphLaunch(gfGraphExec_[consumedSlot], stream_));
+            gfGraphCaptured_[consumedSlot] = true;
+        } else {
+            launchGuidedFilterAlpha(gfState_, slots_[consumedSlot].d_input, d_pha_,
+                                     cfg_.gfRadius, cfg_.gfEps, cfg_.perfLevel, stream_);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 

@@ -126,6 +126,11 @@ private:
 
     GuidedFilterState gfState_;
 
+    // CUDA graphs for guided filter (perf-level >= 3)
+    cudaGraph_t gfGraph_[NUM_SLOTS] = {};
+    cudaGraphExec_t gfGraphExec_[NUM_SLOTS] = {};
+    bool gfGraphCaptured_[NUM_SLOTS] = {};
+
     size_t rgbBytes_ = 0;
     size_t yuyvBytes_ = 0;
     size_t stagingSize_ = 0;
