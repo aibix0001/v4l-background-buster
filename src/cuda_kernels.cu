@@ -177,6 +177,96 @@ __global__ void boxFilterVerticalKernel(const float* __restrict__ input,
     output[y * width + x] = sum / static_cast<float>(ksize);
 }
 
+// ---------------------------------------------------------------------------
+// Shared memory box filter variants (perf-level >= 2)
+// Each thread block cooperatively loads a tile + halo into shared memory,
+// then each thread reads from shared memory instead of global memory.
+// ---------------------------------------------------------------------------
+
+// Horizontal pass with shared memory
+// Block: (TILE_W, TILE_H), each row loads TILE_W + 2*radius elements
+__global__ void boxFilterHorizontalShmemKernel(const float* __restrict__ input,
+                                                float* __restrict__ output,
+                                                int width, int height, int radius) {
+    extern __shared__ float sdata[];
+    // sdata layout: TILE_H rows, each (blockDim.x + 2*radius) wide
+    int tileW = blockDim.x + 2 * radius;
+
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Load tile + halo into shared memory
+    int rowBase = threadIdx.y * tileW;
+    // Each thread loads its center element
+    int srcX = min(max(x, 0), width - 1);
+    int srcY = min(max(y, 0), height - 1);
+    sdata[rowBase + threadIdx.x + radius] = input[srcY * width + srcX];
+
+    // Left halo: first 'radius' threads load left neighbors
+    if (threadIdx.x < radius) {
+        int lx = min(max((int)(blockIdx.x * blockDim.x) - radius + (int)threadIdx.x, 0), width - 1);
+        sdata[rowBase + threadIdx.x] = input[srcY * width + lx];
+    }
+    // Right halo: last 'radius' threads load right neighbors
+    if (threadIdx.x >= blockDim.x - radius) {
+        int offset = threadIdx.x - (blockDim.x - radius);
+        int rx = min((int)(blockIdx.x * blockDim.x + blockDim.x) + offset, width - 1);
+        sdata[rowBase + blockDim.x + radius + offset] = input[srcY * width + rx];
+    }
+
+    __syncthreads();
+
+    if (x >= width || y >= height) return;
+
+    int ksize = 2 * radius + 1;
+    float sum = 0.0f;
+    for (int dx = 0; dx < ksize; dx++) {
+        sum += sdata[rowBase + threadIdx.x + dx];
+    }
+    output[y * width + x] = sum / static_cast<float>(ksize);
+}
+
+// Vertical pass with shared memory
+// Block: (TILE_W, TILE_H), each column loads TILE_H + 2*radius elements
+__global__ void boxFilterVerticalShmemKernel(const float* __restrict__ input,
+                                              float* __restrict__ output,
+                                              int width, int height, int radius) {
+    extern __shared__ float sdata[];
+
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    int colW = blockDim.x;  // stride in shared memory
+
+    // Load center element
+    int srcX = min(max(x, 0), width - 1);
+    int srcY = min(max(y, 0), height - 1);
+    sdata[(threadIdx.y + radius) * colW + threadIdx.x] = input[srcY * width + srcX];
+
+    // Top halo
+    if (threadIdx.y < radius) {
+        int ty = min(max((int)(blockIdx.y * blockDim.y) - radius + (int)threadIdx.y, 0), height - 1);
+        sdata[threadIdx.y * colW + threadIdx.x] = input[ty * width + srcX];
+    }
+    // Bottom halo
+    if (threadIdx.y >= blockDim.y - radius) {
+        int offset = threadIdx.y - (blockDim.y - radius);
+        int by = min((int)(blockIdx.y * blockDim.y + blockDim.y) + offset, height - 1);
+        sdata[(blockDim.y + radius + offset) * colW + threadIdx.x] = input[by * width + srcX];
+    }
+
+    __syncthreads();
+
+    if (x >= width || y >= height) return;
+
+    int ksize = 2 * radius + 1;
+    float sum = 0.0f;
+    for (int dy = 0; dy < ksize; dy++) {
+        sum += sdata[(threadIdx.y + dy) * colW + threadIdx.x];
+    }
+    output[y * width + x] = sum / static_cast<float>(ksize);
+}
+
 // Elementwise multiply: out[i] = a[i] * b[i]
 __global__ void elementwiseMultiplyKernel(const float* __restrict__ a,
                                            const float* __restrict__ b,
@@ -298,6 +388,25 @@ void guidedFilterFree(GuidedFilterState& state) {
     state = {};
 }
 
+// Helper: launch a separable box filter (horizontal + vertical) with kernel selection
+static void launchBoxFilter(const float* input, float* tmp, float* output,
+                             int width, int height, int radius, int perfLevel,
+                             dim3 lrGrid, dim3 block, cudaStream_t stream) {
+    if (perfLevel >= 2) {
+        size_t shmemH = block.y * (block.x + 2 * radius) * sizeof(float);
+        size_t shmemV = block.x * (block.y + 2 * radius) * sizeof(float);
+        boxFilterHorizontalShmemKernel<<<lrGrid, block, shmemH, stream>>>(
+            input, tmp, width, height, radius);
+        boxFilterVerticalShmemKernel<<<lrGrid, block, shmemV, stream>>>(
+            tmp, output, width, height, radius);
+    } else {
+        boxFilterHorizontalKernel<<<lrGrid, block, 0, stream>>>(
+            input, tmp, width, height, radius);
+        boxFilterVerticalKernel<<<lrGrid, block, 0, stream>>>(
+            tmp, output, width, height, radius);
+    }
+}
+
 void launchGuidedFilterAlpha(GuidedFilterState& state,
                               const uint8_t* d_rgb,
                               float* d_alpha,
@@ -324,39 +433,28 @@ void launchGuidedFilterAlpha(GuidedFilterState& state,
         d_alpha, state.d_alpha_lr, fullW, lrW, lrH, s);
 
     // 3. Box filter I → mean_I
-    boxFilterHorizontalKernel<<<lrGrid, block, 0, stream>>>(
-        state.d_guide_lr, state.d_tmp, lrW, lrH, radius);
-    boxFilterVerticalKernel<<<lrGrid, block, 0, stream>>>(
-        state.d_tmp, state.d_mean_I, lrW, lrH, radius);
+    launchBoxFilter(state.d_guide_lr, state.d_tmp, state.d_mean_I,
+                     lrW, lrH, radius, perfLevel, lrGrid, block, stream);
 
     // 4. Box filter p → mean_p
-    boxFilterHorizontalKernel<<<lrGrid, block, 0, stream>>>(
-        state.d_alpha_lr, state.d_tmp, lrW, lrH, radius);
-    boxFilterVerticalKernel<<<lrGrid, block, 0, stream>>>(
-        state.d_tmp, state.d_mean_p, lrW, lrH, radius);
+    launchBoxFilter(state.d_alpha_lr, state.d_tmp, state.d_mean_p,
+                     lrW, lrH, radius, perfLevel, lrGrid, block, stream);
 
     // 5-6. Compute products I*p and I*I, then box filter each
     if (perfLevel >= 1) {
-        // Fused: compute both I*p and I*I in one pass
         computeProductsKernel<<<gridN, blockN, 0, stream>>>(
             state.d_guide_lr, state.d_alpha_lr, state.d_mean_Ip, state.d_mean_II, lrN);
     } else {
-        // Separate multiplies (v0.3 baseline)
         elementwiseMultiplyKernel<<<gridN, blockN, 0, stream>>>(
             state.d_guide_lr, state.d_alpha_lr, state.d_mean_Ip, lrN);
         elementwiseMultiplyKernel<<<gridN, blockN, 0, stream>>>(
             state.d_guide_lr, state.d_guide_lr, state.d_mean_II, lrN);
     }
 
-    boxFilterHorizontalKernel<<<lrGrid, block, 0, stream>>>(
-        state.d_mean_Ip, state.d_tmp, lrW, lrH, radius);
-    boxFilterVerticalKernel<<<lrGrid, block, 0, stream>>>(
-        state.d_tmp, state.d_mean_Ip, lrW, lrH, radius);
-
-    boxFilterHorizontalKernel<<<lrGrid, block, 0, stream>>>(
-        state.d_mean_II, state.d_tmp, lrW, lrH, radius);
-    boxFilterVerticalKernel<<<lrGrid, block, 0, stream>>>(
-        state.d_tmp, state.d_mean_II, lrW, lrH, radius);
+    launchBoxFilter(state.d_mean_Ip, state.d_tmp, state.d_mean_Ip,
+                     lrW, lrH, radius, perfLevel, lrGrid, block, stream);
+    launchBoxFilter(state.d_mean_II, state.d_tmp, state.d_mean_II,
+                     lrW, lrH, radius, perfLevel, lrGrid, block, stream);
 
     // 7. Compute coefficients a, b
     computeCoefficientsKernel<<<lrGrid, block, 0, stream>>>(
@@ -364,16 +462,12 @@ void launchGuidedFilterAlpha(GuidedFilterState& state,
         state.d_a, state.d_b, lrW, lrH, eps);
 
     // 8. Box filter a → mean_a
-    boxFilterHorizontalKernel<<<lrGrid, block, 0, stream>>>(
-        state.d_a, state.d_tmp, lrW, lrH, radius);
-    boxFilterVerticalKernel<<<lrGrid, block, 0, stream>>>(
-        state.d_tmp, state.d_mean_a, lrW, lrH, radius);
+    launchBoxFilter(state.d_a, state.d_tmp, state.d_mean_a,
+                     lrW, lrH, radius, perfLevel, lrGrid, block, stream);
 
     // 9. Box filter b → mean_b
-    boxFilterHorizontalKernel<<<lrGrid, block, 0, stream>>>(
-        state.d_b, state.d_tmp, lrW, lrH, radius);
-    boxFilterVerticalKernel<<<lrGrid, block, 0, stream>>>(
-        state.d_tmp, state.d_mean_b, lrW, lrH, radius);
+    launchBoxFilter(state.d_b, state.d_tmp, state.d_mean_b,
+                     lrW, lrH, radius, perfLevel, lrGrid, block, stream);
 
     // 10. Upsample and apply: alpha = a_up * I_full + b_up
     upsampleAndApplyKernel<<<fullGrid, block, 0, stream>>>(
