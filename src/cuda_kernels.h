@@ -52,5 +52,5 @@ void launchDespill(float* d_fgr, const float* d_pha,
 // output: YUYV packed uint8
 void launchCompositeToYuyv(const float* d_fgr, const float* d_pha,
                            uint8_t* d_yuyv, int width, int height,
-                           uint8_t bgR, uint8_t bgG, uint8_t bgB,
+                           float bgRf, float bgGf, float bgBf,
                            cudaStream_t stream);

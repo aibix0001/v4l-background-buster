@@ -92,6 +92,9 @@ private:
     std::atomic<bool> stopCapture_{false};
     bool captureError_ = false;  // accessed under mtx_
 
+    // Pre-computed background color as float [0,1]
+    float bgRf_ = 0.0f, bgGf_ = 0.0f, bgBf_ = 0.0f;
+
     // Pinned host output (single-buffered, consumed before next frame)
     uint8_t* h_output_ = nullptr;
 

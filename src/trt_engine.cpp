@@ -81,8 +81,9 @@ bool TrtEngine::buildFromOnnx(const std::string& onnxPath, const std::string& pl
         builder->createBuilderConfig());
     if (!config) return false;
 
-    // 2 GB workspace
-    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 2ULL << 30);
+    // 4 GB workspace
+    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 4ULL << 30);
+    config->setBuilderOptimizationLevel(5);
 
     if (fp16 && builder->platformHasFastFp16()) {
         config->setFlag(nvinfer1::BuilderFlag::kFP16);

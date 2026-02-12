@@ -24,7 +24,8 @@ static std::string resolveResolutionTag(int w, int h) {
 
 Pipeline::Pipeline(const PipelineConfig& cfg)
     : cfg_(cfg),
-      capture_(cfg.inputDevice, cfg.width, cfg.height) {}
+      capture_(cfg.inputDevice, cfg.width, cfg.height),
+      bgRf_(cfg.bgR / 255.0f), bgGf_(cfg.bgG / 255.0f), bgBf_(cfg.bgB / 255.0f) {}
 
 Pipeline::~Pipeline() {
     // Stop capture thread
@@ -208,7 +209,7 @@ bool Pipeline::allocateGpuMemory() {
     }
 
     // Single-buffered allocations (outputs, consumed before next frame)
-    CUDA_CHECK(cudaHostAlloc(&h_output_, yuyvBytes_, cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&h_output_, yuyvBytes_, cudaHostAllocWriteCombined));
     CUDA_CHECK(cudaMalloc(&d_fgr_, fgrBytes));
     CUDA_CHECK(cudaMalloc(&d_pha_, phaBytes));
     if (cfg_.alphaSmoothing < 1.0f) {
@@ -469,7 +470,7 @@ bool Pipeline::processFrame() {
     // 3e. Despill: suppress background color contamination at edges
     if (cfg_.despillStrength > 0.0f) {
         launchDespill(d_fgr_, d_pha_, cfg_.width, cfg_.height,
-                      cfg_.bgR / 255.0f, cfg_.bgG / 255.0f, cfg_.bgB / 255.0f,
+                      bgRf_, bgGf_, bgBf_,
                       cfg_.despillStrength, stream_);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -477,7 +478,7 @@ bool Pipeline::processFrame() {
     // 4. Composite + color convert
     launchCompositeToYuyv(d_fgr_, d_pha_, d_outputYuyv_,
                           cfg_.width, cfg_.height,
-                          cfg_.bgR, cfg_.bgG, cfg_.bgB, stream_);
+                          bgRf_, bgGf_, bgBf_, stream_);
     CUDA_CHECK(cudaGetLastError());
 
     // 5. Download and write

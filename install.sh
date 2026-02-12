@@ -248,6 +248,8 @@ if [ "$SKIP_MODEL" = false ]; then
                 --onnx="$ONNX_IN" \
                 --saveEngine="$PLAN_OUT" \
                 --fp16 \
+                --builderOptimizationLevel=5 \
+                --timingCacheFile="$MODEL_DIR/timing.cache" \
                 2>&1 | tail -5
             ok "Engine built: $PLAN_OUT"
         else

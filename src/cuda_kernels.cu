@@ -427,16 +427,13 @@ __global__ void compositeToYuyvKernel(const float* __restrict__ fgr,
                                        const float* __restrict__ pha,
                                        uint8_t* __restrict__ yuyv,
                                        int width, int height,
-                                       uint8_t bgR, uint8_t bgG, uint8_t bgB) {
+                                       float bgRf, float bgGf, float bgBf) {
     int macroX = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     int halfW = width / 2;
     if (macroX >= halfW || y >= height) return;
 
     int planeSize = width * height;
-    float bgRf = bgR / 255.0f;
-    float bgGf = bgG / 255.0f;
-    float bgBf = bgB / 255.0f;
 
     float R[2], G[2], B[2];
     for (int i = 0; i < 2; i++) {
@@ -483,11 +480,11 @@ __global__ void compositeToYuyvKernel(const float* __restrict__ fgr,
 
 void launchCompositeToYuyv(const float* d_fgr, const float* d_pha,
                            uint8_t* d_yuyv, int width, int height,
-                           uint8_t bgR, uint8_t bgG, uint8_t bgB,
+                           float bgRf, float bgGf, float bgBf,
                            cudaStream_t stream) {
     int halfW = width / 2;
     dim3 block(32, 8);
     dim3 grid((halfW + block.x - 1) / block.x, (height + block.y - 1) / block.y);
     compositeToYuyvKernel<<<grid, block, 0, stream>>>(
-        d_fgr, d_pha, d_yuyv, width, height, bgR, bgG, bgB);
+        d_fgr, d_pha, d_yuyv, width, height, bgRf, bgGf, bgBf);
 }
