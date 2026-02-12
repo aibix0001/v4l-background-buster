@@ -488,3 +488,95 @@ void launchCompositeToYuyv(const float* d_fgr, const float* d_pha,
     compositeToYuyvKernel<<<grid, block, 0, stream>>>(
         d_fgr, d_pha, d_yuyv, width, height, bgRf, bgGf, bgBf);
 }
+
+// ---------------------------------------------------------------------------
+// Fused despill + composite + YUYV (perf-level >= 1)
+// Reads fgr and pha once, does despill in-register, then composite + YUYV.
+// ---------------------------------------------------------------------------
+__global__ void despillCompositeToYuyvKernel(const float* __restrict__ fgr,
+                                              const float* __restrict__ pha,
+                                              uint8_t* __restrict__ yuyv,
+                                              int width, int height,
+                                              float bgRf, float bgGf, float bgBf,
+                                              float despillStrength) {
+    int macroX = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int halfW = width / 2;
+    if (macroX >= halfW || y >= height) return;
+
+    int planeSize = width * height;
+
+    // BT.601 RGB→YUV helpers (as lambdas)
+    auto toY = [](float r, float g, float b) -> uint8_t {
+        float yv = 16.0f + 65.481f * r / 255.0f + 128.553f * g / 255.0f + 24.966f * b / 255.0f;
+        return static_cast<uint8_t>(fminf(fmaxf(yv, 0.0f), 255.0f));
+    };
+    auto toU = [](float r, float g, float b) -> uint8_t {
+        float u = 128.0f - 37.797f * r / 255.0f - 74.203f * g / 255.0f + 112.0f * b / 255.0f;
+        return static_cast<uint8_t>(fminf(fmaxf(u, 0.0f), 255.0f));
+    };
+    auto toV = [](float r, float g, float b) -> uint8_t {
+        float v = 128.0f + 112.0f * r / 255.0f - 93.786f * g / 255.0f - 18.214f * b / 255.0f;
+        return static_cast<uint8_t>(fminf(fmaxf(v, 0.0f), 255.0f));
+    };
+
+    float R[2], G[2], B[2];
+    for (int i = 0; i < 2; i++) {
+        int x = macroX * 2 + i;
+        int idx = y * width + x;
+
+        float alpha = pha[idx];
+        float r = fgr[0 * planeSize + idx];
+        float g = fgr[1 * planeSize + idx];
+        float b = fgr[2 * planeSize + idx];
+
+        // In-register despill
+        if (despillStrength > 0.0f) {
+            float edgeWeight = 4.0f * alpha * (1.0f - alpha);
+            if (edgeWeight >= 0.01f) {
+                float es = despillStrength * edgeWeight;
+                float limit;
+                if (bgGf > bgRf && bgGf > bgBf) {
+                    limit = fmaxf(r, b);
+                    if (g > limit) g = limit + (g - limit) * (1.0f - es);
+                } else if (bgBf > bgRf && bgBf > bgGf) {
+                    limit = fmaxf(r, g);
+                    if (b > limit) b = limit + (b - limit) * (1.0f - es);
+                } else {
+                    limit = fmaxf(g, b);
+                    if (r > limit) r = limit + (r - limit) * (1.0f - es);
+                }
+            }
+        }
+
+        // Composite: foreground * alpha + background * (1 - alpha)
+        R[i] = fminf(fmaxf(r * alpha + bgRf * (1.0f - alpha), 0.0f), 1.0f) * 255.0f;
+        G[i] = fminf(fmaxf(g * alpha + bgGf * (1.0f - alpha), 0.0f), 1.0f) * 255.0f;
+        B[i] = fminf(fmaxf(b * alpha + bgBf * (1.0f - alpha), 0.0f), 1.0f) * 255.0f;
+    }
+
+    uint8_t Y0 = toY(R[0], G[0], B[0]);
+    uint8_t Y1 = toY(R[1], G[1], B[1]);
+    uint8_t U = static_cast<uint8_t>((static_cast<int>(toU(R[0], G[0], B[0])) +
+                                       static_cast<int>(toU(R[1], G[1], B[1]))) / 2);
+    uint8_t Vv = static_cast<uint8_t>((static_cast<int>(toV(R[0], G[0], B[0])) +
+                                        static_cast<int>(toV(R[1], G[1], B[1]))) / 2);
+
+    int outOff = (y * halfW + macroX) * 4;
+    yuyv[outOff + 0] = Y0;
+    yuyv[outOff + 1] = U;
+    yuyv[outOff + 2] = Y1;
+    yuyv[outOff + 3] = Vv;
+}
+
+void launchDespillCompositeToYuyv(const float* d_fgr, const float* d_pha,
+                                   uint8_t* d_yuyv, int width, int height,
+                                   float bgRf, float bgGf, float bgBf,
+                                   float despillStrength,
+                                   cudaStream_t stream) {
+    int halfW = width / 2;
+    dim3 block(32, 8);
+    dim3 grid((halfW + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    despillCompositeToYuyvKernel<<<grid, block, 0, stream>>>(
+        d_fgr, d_pha, d_yuyv, width, height, bgRf, bgGf, bgBf, despillStrength);
+}

@@ -467,19 +467,27 @@ bool Pipeline::processFrame() {
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // 3e. Despill: suppress background color contamination at edges
-    if (cfg_.despillStrength > 0.0f) {
-        launchDespill(d_fgr_, d_pha_, cfg_.width, cfg_.height,
-                      bgRf_, bgGf_, bgBf_,
-                      cfg_.despillStrength, stream_);
+    // 3e + 4. Despill and composite + color convert
+    if (cfg_.perfLevel >= 1) {
+        // Fused: despill + composite + YUYV in one kernel
+        launchDespillCompositeToYuyv(d_fgr_, d_pha_, d_outputYuyv_,
+                                      cfg_.width, cfg_.height,
+                                      bgRf_, bgGf_, bgBf_,
+                                      cfg_.despillStrength, stream_);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        // Separate kernels (v0.3 baseline)
+        if (cfg_.despillStrength > 0.0f) {
+            launchDespill(d_fgr_, d_pha_, cfg_.width, cfg_.height,
+                          bgRf_, bgGf_, bgBf_,
+                          cfg_.despillStrength, stream_);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        launchCompositeToYuyv(d_fgr_, d_pha_, d_outputYuyv_,
+                              cfg_.width, cfg_.height,
+                              bgRf_, bgGf_, bgBf_, stream_);
         CUDA_CHECK(cudaGetLastError());
     }
-
-    // 4. Composite + color convert
-    launchCompositeToYuyv(d_fgr_, d_pha_, d_outputYuyv_,
-                          cfg_.width, cfg_.height,
-                          bgRf_, bgGf_, bgBf_, stream_);
-    CUDA_CHECK(cudaGetLastError());
 
     // 5. Download and write
     CUDA_CHECK(cudaMemcpyAsync(h_output_, d_outputYuyv_, yuyvBytes_,

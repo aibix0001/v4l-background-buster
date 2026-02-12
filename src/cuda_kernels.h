@@ -54,3 +54,10 @@ void launchCompositeToYuyv(const float* d_fgr, const float* d_pha,
                            uint8_t* d_yuyv, int width, int height,
                            float bgRf, float bgGf, float bgBf,
                            cudaStream_t stream);
+
+// Fused despill + composite + YUYV in a single kernel (perf-level >= 1)
+void launchDespillCompositeToYuyv(const float* d_fgr, const float* d_pha,
+                                   uint8_t* d_yuyv, int width, int height,
+                                   float bgRf, float bgGf, float bgBf,
+                                   float despillStrength,
+                                   cudaStream_t stream);
