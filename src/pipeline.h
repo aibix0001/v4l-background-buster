@@ -96,8 +96,18 @@ private:
     // Pre-computed background color as float [0,1]
     float bgRf_ = 0.0f, bgGf_ = 0.0f, bgBf_ = 0.0f;
 
-    // Pinned host output (single-buffered, consumed before next frame)
-    uint8_t* h_output_ = nullptr;
+    // Host output buffers: single-buffered (level 0-1) or double-buffered (level >= 2)
+    uint8_t* h_output_[2] = {};
+    int outputWriteIdx_ = 0;
+
+    // Output thread (perf-level >= 2): writes frames asynchronously
+    std::thread outputThread_;
+    std::mutex outputMtx_;
+    std::condition_variable outputCv_;
+    bool outputReady_ = false;
+    int outputBufIdx_ = 0;
+    size_t outputSize_ = 0;
+    std::atomic<bool> stopOutput_{false};
 
     // Device memory: TRT outputs and final YUYV (single-buffered)
     float*   d_fgr_ = nullptr;
@@ -129,4 +139,5 @@ private:
     bool allocateGpuMemory();
     void freeGpuMemory();
     void captureThreadFunc();
+    void outputThreadFunc();
 };

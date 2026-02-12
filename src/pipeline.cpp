@@ -28,6 +28,12 @@ Pipeline::Pipeline(const PipelineConfig& cfg)
       bgRf_(cfg.bgR / 255.0f), bgGf_(cfg.bgG / 255.0f), bgBf_(cfg.bgB / 255.0f) {}
 
 Pipeline::~Pipeline() {
+    // Stop output thread
+    stopOutput_ = true;
+    outputCv_.notify_all();
+    if (outputThread_.joinable())
+        outputThread_.join();
+
     // Stop capture thread
     stopCapture_ = true;
     cvConsumed_.notify_all();
@@ -160,6 +166,10 @@ bool Pipeline::init() {
     // Start capture thread
     captureThread_ = std::thread(&Pipeline::captureThreadFunc, this);
 
+    // Start output thread (perf-level >= 2)
+    if (cfg_.perfLevel >= 2)
+        outputThread_ = std::thread(&Pipeline::outputThreadFunc, this);
+
     fprintf(stderr, "Pipeline initialized successfully (double-buffered)\n");
     return true;
 }
@@ -208,8 +218,11 @@ bool Pipeline::allocateGpuMemory() {
         CUDA_CHECK(cudaMalloc(&slot.d_src, srcBytes));
     }
 
-    // Single-buffered allocations (outputs, consumed before next frame)
-    CUDA_CHECK(cudaHostAlloc(&h_output_, yuyvBytes_, cudaHostAllocWriteCombined));
+    // Output buffer(s): double-buffered at perf-level >= 2, single otherwise
+    CUDA_CHECK(cudaHostAlloc(&h_output_[0], yuyvBytes_, cudaHostAllocWriteCombined));
+    if (cfg_.perfLevel >= 2) {
+        CUDA_CHECK(cudaHostAlloc(&h_output_[1], yuyvBytes_, cudaHostAllocWriteCombined));
+    }
     CUDA_CHECK(cudaMalloc(&d_fgr_, fgrBytes));
     CUDA_CHECK(cudaMalloc(&d_pha_, phaBytes));
     if (cfg_.alphaSmoothing < 1.0f) {
@@ -241,7 +254,8 @@ void Pipeline::freeGpuMemory() {
         if (slot.d_input) { cudaFree(slot.d_input); slot.d_input = nullptr; }
         if (slot.d_src) { cudaFree(slot.d_src); slot.d_src = nullptr; }
     }
-    if (h_output_) { cudaFreeHost(h_output_); h_output_ = nullptr; }
+    for (int i = 0; i < 2; i++)
+        if (h_output_[i]) { cudaFreeHost(h_output_[i]); h_output_[i] = nullptr; }
     if (d_fgr_) { cudaFree(d_fgr_); d_fgr_ = nullptr; }
     if (d_pha_) { cudaFree(d_pha_); d_pha_ = nullptr; }
     if (d_phaPrev_) { cudaFree(d_phaPrev_); d_phaPrev_ = nullptr; }
@@ -347,6 +361,25 @@ void Pipeline::captureThreadFunc() {
         }
 
         slot = 1 - slot;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output thread: writes frames to v4l2loopback asynchronously (perf-level >= 2)
+// ---------------------------------------------------------------------------
+void Pipeline::outputThreadFunc() {
+    while (!stopOutput_) {
+        int bufIdx;
+        size_t size;
+        {
+            std::unique_lock<std::mutex> lock(outputMtx_);
+            outputCv_.wait(lock, [&] { return outputReady_ || stopOutput_.load(); });
+            if (stopOutput_) break;
+            bufIdx = outputBufIdx_;
+            size = outputSize_;
+            outputReady_ = false;
+        }
+        output_->writeFrame(h_output_[bufIdx], size);
     }
 }
 
@@ -490,16 +523,31 @@ bool Pipeline::processFrame() {
     }
 
     // 5. Download and write
-    CUDA_CHECK(cudaMemcpyAsync(h_output_, d_outputYuyv_, yuyvBytes_,
+    int outIdx = outputWriteIdx_;
+    CUDA_CHECK(cudaMemcpyAsync(h_output_[outIdx], d_outputYuyv_, yuyvBytes_,
                                cudaMemcpyDeviceToHost, stream_));
 
     if (cfg_.benchmark)
         cudaEventRecord(evStop_, stream_);
 
     CUDA_CHECK(cudaStreamSynchronize(stream_));
-    if (!output_->writeFrame(h_output_, yuyvBytes_)) {
-        fprintf(stderr, "Failed to write frame to output device\n");
-        return false;
+
+    if (cfg_.perfLevel >= 2) {
+        // Hand buffer to output thread, swap to other buffer
+        {
+            std::lock_guard<std::mutex> lock(outputMtx_);
+            outputBufIdx_ = outIdx;
+            outputSize_ = yuyvBytes_;
+            outputReady_ = true;
+        }
+        outputCv_.notify_one();
+        outputWriteIdx_ = 1 - outIdx;
+    } else {
+        // Synchronous write (v0.3 baseline)
+        if (!output_->writeFrame(h_output_[outIdx], yuyvBytes_)) {
+            fprintf(stderr, "Failed to write frame to output device\n");
+            return false;
+        }
     }
 
     if (cfg_.benchmark) {
