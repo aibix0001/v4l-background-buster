@@ -185,6 +185,20 @@ __global__ void elementwiseMultiplyKernel(const float* __restrict__ a,
     if (i < N) out[i] = a[i] * b[i];
 }
 
+// Fused: compute I*p and I*I in one pass (perf-level >= 1)
+__global__ void computeProductsKernel(const float* __restrict__ I,
+                                       const float* __restrict__ p,
+                                       float* __restrict__ Ip,
+                                       float* __restrict__ II,
+                                       int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    float iv = I[i];
+    float pv = p[i];
+    Ip[i] = iv * pv;
+    II[i] = iv * iv;
+}
+
 // Compute guided filter coefficients a and b from means
 __global__ void computeCoefficientsKernel(const float* __restrict__ mean_I,
                                            const float* __restrict__ mean_p,
@@ -288,6 +302,7 @@ void launchGuidedFilterAlpha(GuidedFilterState& state,
                               const uint8_t* d_rgb,
                               float* d_alpha,
                               int radius, float eps,
+                              int perfLevel,
                               cudaStream_t stream) {
     int lrW = state.lrW, lrH = state.lrH;
     int fullW = state.fullW, fullH = state.fullH;
@@ -297,6 +312,8 @@ void launchGuidedFilterAlpha(GuidedFilterState& state,
     dim3 block(32, 8);
     dim3 lrGrid((lrW + 31) / 32, (lrH + 7) / 8);
     dim3 fullGrid((fullW + 31) / 32, (fullH + 7) / 8);
+    int blockN = 256;
+    int gridN = (lrN + blockN - 1) / blockN;
 
     // 1. Downsample RGB → luminance at 1/s res
     rgbToLuminanceDownsampleKernel<<<lrGrid, block, 0, stream>>>(
@@ -318,19 +335,24 @@ void launchGuidedFilterAlpha(GuidedFilterState& state,
     boxFilterVerticalKernel<<<lrGrid, block, 0, stream>>>(
         state.d_tmp, state.d_mean_p, lrW, lrH, radius);
 
-    // 5. Compute I*p → d_mean_Ip, then box filter
-    int blockN = 256;
-    int gridN = (lrN + blockN - 1) / blockN;
-    elementwiseMultiplyKernel<<<gridN, blockN, 0, stream>>>(
-        state.d_guide_lr, state.d_alpha_lr, state.d_mean_Ip, lrN);
+    // 5-6. Compute products I*p and I*I, then box filter each
+    if (perfLevel >= 1) {
+        // Fused: compute both I*p and I*I in one pass
+        computeProductsKernel<<<gridN, blockN, 0, stream>>>(
+            state.d_guide_lr, state.d_alpha_lr, state.d_mean_Ip, state.d_mean_II, lrN);
+    } else {
+        // Separate multiplies (v0.3 baseline)
+        elementwiseMultiplyKernel<<<gridN, blockN, 0, stream>>>(
+            state.d_guide_lr, state.d_alpha_lr, state.d_mean_Ip, lrN);
+        elementwiseMultiplyKernel<<<gridN, blockN, 0, stream>>>(
+            state.d_guide_lr, state.d_guide_lr, state.d_mean_II, lrN);
+    }
+
     boxFilterHorizontalKernel<<<lrGrid, block, 0, stream>>>(
         state.d_mean_Ip, state.d_tmp, lrW, lrH, radius);
     boxFilterVerticalKernel<<<lrGrid, block, 0, stream>>>(
         state.d_tmp, state.d_mean_Ip, lrW, lrH, radius);
 
-    // 6. Compute I*I → d_mean_II, then box filter
-    elementwiseMultiplyKernel<<<gridN, blockN, 0, stream>>>(
-        state.d_guide_lr, state.d_guide_lr, state.d_mean_II, lrN);
     boxFilterHorizontalKernel<<<lrGrid, block, 0, stream>>>(
         state.d_mean_II, state.d_tmp, lrW, lrH, radius);
     boxFilterVerticalKernel<<<lrGrid, block, 0, stream>>>(

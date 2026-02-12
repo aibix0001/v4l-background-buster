@@ -463,7 +463,7 @@ bool Pipeline::processFrame() {
     // 3d. Guided filter: refine alpha using high-res RGB as guide
     if (cfg_.refineAlpha) {
         launchGuidedFilterAlpha(gfState_, slots_[consumedSlot].d_input, d_pha_,
-                                 cfg_.gfRadius, cfg_.gfEps, stream_);
+                                 cfg_.gfRadius, cfg_.gfEps, cfg_.perfLevel, stream_);
         CUDA_CHECK(cudaGetLastError());
     }
 

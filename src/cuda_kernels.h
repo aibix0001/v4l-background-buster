@@ -39,6 +39,7 @@ void launchGuidedFilterAlpha(GuidedFilterState& state,
                               const uint8_t* d_rgb,
                               float* d_alpha,
                               int radius, float eps,
+                              int perfLevel,
                               cudaStream_t stream);
 
 // Despill: suppress background color contamination in FGR at semi-transparent edges
