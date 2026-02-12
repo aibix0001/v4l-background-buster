@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **v4l-background-buster** (working name: `rvm-vcam`) is a standalone C++ application for real-time AI-powered background removal. It captures video from a USB camera via V4L2, runs Robust Video Matting (RVM) inference using TensorRT FP16, composites the result on GPU, and outputs to a v4l2loopback virtual camera device. Any application (OBS, Discord, Zoom, Teams) can consume the output as a normal camera.
 
-**Current performance**: ~25-30ms/frame (~33-40 FPS) at 1080p on RTX 2060 Super. Trades raw FPS for significantly better edge quality vs v0.2 (~17ms/57 FPS).
+**Current performance**: ~20-25ms/frame (~40-50 FPS) at 1080p on RTX 2060 Super with `--perf-level 3`. v0.4 adds cumulative performance optimizations while preserving v0.3 edge quality (guided filter, despill, ds_ratio=0.5).
 
 ## Build & Run Commands
 
@@ -26,6 +26,7 @@ sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="AI-Camera" exclusiv
 # Run with options
 ./build/rvm-vcam -i /dev/video0 -o /dev/video10 --benchmark
 ./build/rvm-vcam --benchmark -s 0.7    # with alpha smoothing
+./build/rvm-vcam --benchmark --perf-level 3  # max optimizations
 ./build/rvm-vcam --no-refine --despill 0  # disable post-processing
 ./build/rvm-vcam -W 1280 -H 720        # 720p mode
 
@@ -82,7 +83,7 @@ Two `FrameSlot` structs alternate: while the GPU processes frame N, the CPU capt
 | `v4l2_capture.h/cpp` | V4L2 MMAP capture with poll timeout, stale frame draining, EIO retry |
 | `v4l2_output.h/cpp` | Frame writer to v4l2loopback with colorspace metadata |
 | `trt_engine.h/cpp` | TensorRT engine build/load/infer (ONNX→plan caching) |
-| `cuda_kernels.h/cu` | GPU kernels: YUYV→RGB, RGB→FP32, adaptive alpha EMA, guided filter, despill, composite+YUYV |
+| `cuda_kernels.h/cu` | GPU kernels: YUYV→RGB, RGB→FP32, adaptive alpha EMA, guided filter (shmem variants), despill, fused despill+composite+YUYV |
 
 ### Key Design Decisions
 
@@ -99,6 +100,8 @@ Two `FrameSlot` structs alternate: while the GPU processes frame N, the CPU capt
 - **V4L2 hardening**: poll() timeout before DQBUF, format verification after S_FMT, frame rate negotiation, dequeueLatestFrame() drains stale frames, DQBUF retry on EIO, consecutive skip counter.
 - **TensorRT plan files are GPU-specific and TRT-version-specific** — must be regenerated after driver or TensorRT updates.
 - **BT.601 limited-range**: YUYV→RGB uses limited-range coefficients; output sets V4L2 colorspace metadata.
+- **Performance levels (`--perf-level 0-3`)**: Cumulative optimizations — Level 0: v0.3 baseline; Level 1: fused despill+composite+YUYV kernel, fused guided filter products; Level 2: + shared memory box filters, async output thread with double-buffered host output; Level 3: + CUDA graph replay for guided filter (~18 kernels captured into a graph per slot).
+- **Always-on optimizations**: CMAKE_CUDA_ARCHITECTURES=75 (native SM 7.5 SASS), TRT builder optimization level 5, write-combined output buffer, pre-computed float background color passed to kernels.
 
 ### RVM TensorRT Inputs/Outputs
 

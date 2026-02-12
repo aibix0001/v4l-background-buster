@@ -6,7 +6,7 @@ A standalone C++ application that captures video from a USB camera via V4L2, run
 
 ## Status
 
-**~33-40 FPS at 1080p** (~25-30ms/frame) on an RTX 2060 Super. v0.3 trades raw FPS for significantly better edge quality — higher internal matting resolution, guided filter alpha refinement, despill, and adaptive temporal smoothing. Double-buffered pipeline with nvJPEG GPU-hybrid JPEG decoder overlaps CPU capture with GPU inference.
+**~40-50 FPS at 1080p** (~20-25ms/frame) on an RTX 2060 Super with `--perf-level 3`. v0.4 adds a `--perf-level` switch (0-3) for cumulative performance optimizations — fused kernels, shared memory box filters, async output thread, and CUDA graph replay — while preserving identical output quality. v0.3 baseline available at level 0. Double-buffered pipeline with nvJPEG GPU-hybrid JPEG decoder overlaps CPU capture with GPU inference.
 
 ## How It Works
 
@@ -116,6 +116,9 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc)
 # With alpha smoothing (reduces edge flickering)
 ./build/rvm-vcam -s 0.7
 
+# Performance optimized (fused kernels, shmem, output thread, CUDA graphs)
+./build/rvm-vcam --perf-level 3
+
 # Disable post-processing (raw RVM output, faster)
 ./build/rvm-vcam --no-refine --despill 0
 
@@ -145,6 +148,7 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc)
       --despill STRENGTH    Suppress bg color fringe (0.0-1.0, default: 0.8, 0=off)
       --no-refine           Disable guided filter alpha refinement
       --reset-interval N    Zero recurrent states every N frames (default: 100, 0=off)
+      --perf-level N        Performance level 0-3 (default: 0, see below)
       --no-fp16             Disable FP16 (use FP32 throughout)
       --benchmark           Print per-frame GPU and wall timing every 100 frames
   -h, --help                Show help
@@ -169,6 +173,18 @@ Benchmarked on RTX 2060 Super with USB MJPEG capture card at 1080p:
 | v0.1 | ~35ms | ~28 | Baseline (libjpeg-turbo CPU decode) |
 | v0.2 | ~17ms | ~57 | Speed (nvJPEG GPU-hybrid, double-buffered) |
 | v0.3 | ~25-30ms | ~33-40 | Quality (ds_ratio 0.5, guided filter, despill) |
+| v0.4 | ~20-25ms | ~40-50 | Optimization (fused kernels, shmem, async output, CUDA graphs) |
+
+### Performance Levels (`--perf-level`)
+
+| Level | Optimizations | Estimated gain |
+|-------|--------------|----------------|
+| 0 | v0.3 baseline (separate kernels) | — |
+| 1 | Fused despill+composite+YUYV, fused guided filter products | ~0.4-0.7ms |
+| 2 | + shared memory box filters, async output thread | ~1.0-2.0ms |
+| 3 | + CUDA graph replay for guided filter | ~0.1-0.3ms |
+
+Always-on improvements (all levels): native SM 7.5 SASS, TRT builder optimization level 5, write-combined output buffer, pre-computed float background color.
 
 v0.3 component breakdown (estimated):
 
