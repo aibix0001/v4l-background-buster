@@ -28,6 +28,7 @@ struct PipelineConfig {
     int gfRadius = 3;            // guided filter radius (at low-res)
     float gfEps = 0.005f;        // guided filter regularization
     int resetInterval = 100;     // zero recurrent states every N frames (0 = disable)
+    int perfLevel = 0;           // 0=baseline, 1=fused kernels, 2=+shmem+output thread, 3=+CUDA graphs
     bool benchmark = false;
 };
 

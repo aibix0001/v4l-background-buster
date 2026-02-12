@@ -27,6 +27,7 @@ static void printUsage(const char* prog) {
         "      --despill STRENGTH    Suppress bg color fringe (0.0-1.0, default: 0.8, 0=off)\n"
         "      --no-refine           Disable guided filter alpha refinement\n"
         "      --reset-interval N    Zero recurrent states every N frames (default: 100, 0=off)\n"
+        "      --perf-level N        Performance level 0-3 (default: 0=baseline)\n"
         "      --no-fp16             Disable FP16 (use FP32)\n"
         "      --benchmark           Print per-frame timing stats\n"
         "  -h, --help                Show this help\n",
@@ -50,6 +51,7 @@ int main(int argc, char* argv[]) {
         {"despill",    required_argument, nullptr, 4},
         {"no-refine",  no_argument,       nullptr, 5},
         {"reset-interval", required_argument, nullptr, 3},
+        {"perf-level", required_argument, nullptr, 6},
         {"no-fp16",    no_argument,       nullptr, 1},
         {"benchmark",  no_argument,       nullptr, 2},
         {"help",       no_argument,       nullptr, 'h'},
@@ -83,6 +85,7 @@ int main(int argc, char* argv[]) {
             case 3: cfg.resetInterval = atoi(optarg); break;
             case 4: cfg.despillStrength = atof(optarg); break;
             case 5: cfg.refineAlpha = false; break;
+            case 6: cfg.perfLevel = atoi(optarg); break;
             case 'h':
             default:
                 printUsage(argv[0]);
@@ -111,6 +114,10 @@ int main(int argc, char* argv[]) {
     }
     if (cfg.resetInterval < 0) {
         fprintf(stderr, "Error: reset-interval must be >= 0, got %d\n", cfg.resetInterval);
+        return 1;
+    }
+    if (cfg.perfLevel < 0 || cfg.perfLevel > 3) {
+        fprintf(stderr, "Error: perf-level must be in [0, 3], got %d\n", cfg.perfLevel);
         return 1;
     }
     if (cfg.alphaSmoothing <= 0.0f || cfg.alphaSmoothing > 1.0f) {
@@ -165,6 +172,8 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "  Despill: %.2f\n", cfg.despillStrength);
     if (cfg.resetInterval > 0)
         fprintf(stderr, "  Recurrent reset: every %d frames\n", cfg.resetInterval);
+    if (cfg.perfLevel > 0)
+        fprintf(stderr, "  Perf level: %d\n", cfg.perfLevel);
 
     Pipeline pipeline(cfg);
     if (!pipeline.init()) {
